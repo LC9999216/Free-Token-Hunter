@@ -18,6 +18,7 @@ class GroundedField(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     field: str
+    value: Optional[str] = None
     evidence_id: str
     quote: str
     start_offset: int

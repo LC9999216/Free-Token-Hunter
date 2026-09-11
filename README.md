@@ -80,7 +80,10 @@ hunter collect-evidence --candidate-id ID
 hunter run-stage-one --as-of ISO_TIMESTAMP   # alias: hunter pipeline
 ```
 
-`run-stage-one` is fully offline against the frozen fixture and prints the stage-one summary:
+`run-stage-one` resolves and fetches public evidence before validation.  Without a configured
+real LLM extractor it fails closed at the pending/uncertain boundary and never confirms a
+Provider.  The automated fixture tests inject deterministic fake fetcher and extractor
+boundaries and print the stage-one summary:
 
 ```text
 candidates_processed, providers_created, providers_updated, free_confirmed,

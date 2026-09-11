@@ -9,7 +9,7 @@ import pytest
 
 from hunter.evidence.models import Evidence, Officiality
 from hunter.evidence.validator import OfficialEvidenceValidator, TrustAnchor
-from hunter.llm.models import ExtractionResult
+from hunter.llm.models import ExtractionResult, GroundedField
 from hunter.registry.confirmation import (
     ConfirmationError,
     ConfirmationInput,
@@ -57,7 +57,58 @@ def _evidence(official: Officiality = Officiality.OFFICIAL, source: str = "prici
 
 
 def _extraction(ok: bool = True, offer_kind: str = "free_tier", **kw) -> ExtractionResult:
-    return ExtractionResult(ok=ok, offer_kind=offer_kind, offer_status=None, **kw)
+    quote = "free plan programmatic API"
+    values = dict(kw)
+    actual_kind = values.get("offer_kind", offer_kind)
+    grounded_fields = values.pop("grounded_fields", None)
+    if grounded_fields is None:
+        grounded_fields = [
+            GroundedField(
+                field="offer_kind",
+                value=actual_kind,
+                evidence_id="ev-acme-pricing",
+                quote=quote,
+                start_offset=0,
+                end_offset=len(quote),
+            )
+        ]
+        for field_name in (
+            "quota_mode",
+            "renewal_period",
+            "access_method",
+            "description",
+            "quota_text",
+            "expires_at",
+            "card_required",
+            "phone_required",
+            "commercial_use_allowed",
+            "signup_required",
+            "openai_compatible",
+            "base_url",
+        ):
+            if values.get(field_name) is not None:
+                value = values[field_name]
+                grounded_fields.append(
+                    GroundedField(
+                        field=field_name,
+                        value=value if field_name in {
+                            "quota_mode",
+                            "renewal_period",
+                            "access_method",
+                        } else None,
+                        evidence_id="ev-acme-pricing",
+                        quote=quote,
+                        start_offset=0,
+                        end_offset=len(quote),
+                    )
+                )
+    return ExtractionResult(
+        ok=ok,
+        offer_kind=actual_kind,
+        offer_status=None,
+        grounded_fields=grounded_fields,
+        **values,
+    )
 
 
 def _input(**kw) -> ConfirmationInput:

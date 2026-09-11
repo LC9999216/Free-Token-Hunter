@@ -64,8 +64,8 @@ def validate_grounding(
         if f.field not in SUPPORTED_FIELDS:
             errors.append(f"unsupported field {f.field!r}")
             continue
-        if f.field in _VALID_ENUMS and f.quote not in _VALID_ENUMS[f.field]:
-            errors.append(f"unknown enum value {f.quote!r} for {f.field!r}")
+        if f.field in _VALID_ENUMS and f.value not in _VALID_ENUMS[f.field]:
+            errors.append(f"unknown enum value {f.value!r} for {f.field!r}")
             continue
         evidence = by_id.get(f.evidence_id)
         if evidence is None:
@@ -185,18 +185,28 @@ class GroundedExtractor:
                     fields.extend(gf)
                     errors.extend(errs)
                 continue
-            if name in SCALAR_ENUM_FIELDS and isinstance(value, str):
-                if value not in _VALID_ENUMS.get(name, {value}):
-                    errors.append(f"{name}: unknown enum value {value!r}")
+            if name in SCALAR_ENUM_FIELDS:
+                if not isinstance(value, dict):
+                    errors.append(f"{name}: expected grounded object with value")
                     continue
-                verbatim[name] = value
+                enum_value = value.get("value")
+                if enum_value not in _VALID_ENUMS.get(name, set()):
+                    errors.append(f"{name}: unknown enum value {enum_value!r}")
+                    continue
+                gf, errs = self._field_from(value, name, enum_value=enum_value)
+                fields.extend(gf)
+                errors.extend(errs)
+                if not errs:
+                    verbatim[name] = enum_value
                 continue
             gf, errs = self._field_from(value, name)
             fields.extend(gf)
             errors.extend(errs)
         return fields, verbatim, errors
 
-    def _field_from(self, value: Any, name: str) -> Tuple[List[GroundedField], List[str]]:
+    def _field_from(
+        self, value: Any, name: str, enum_value: Optional[str] = None
+    ) -> Tuple[List[GroundedField], List[str]]:
         if value is None:
             return [], []
         if not isinstance(value, dict):
@@ -209,6 +219,7 @@ class GroundedExtractor:
             return [], [f"{name}: missing quote or offsets"]
         gf = GroundedField(
             field=name,
+            value=enum_value,
             evidence_id=str(evidence_id or ""),
             quote=quote,
             start_offset=start,
@@ -230,6 +241,8 @@ class GroundedExtractor:
         for f in fields:
             if f.field == "models":
                 models.append(f.quote)
+            elif f.field in SCALAR_ENUM_FIELDS:
+                grounded[f.field] = f.value or ""
             else:
                 grounded[f.field] = f.quote
         return ExtractionResult(

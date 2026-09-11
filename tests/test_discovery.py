@@ -263,6 +263,34 @@ def test_orchestrator_aggregates_and_persists_once(tmp_path: Path) -> None:
     assert cand.observations[0].source_type == SourceType.github
 
 
+def test_unrelated_github_repositories_get_distinct_candidates_without_github_domain_hint(
+    tmp_path: Path,
+) -> None:
+    http = FakeGitHubHttp(
+        pages_by_query={
+            "q": [
+                {
+                    "total_count": 2,
+                    "items": [
+                        _gh_result(101, "one/free-api", "https://github.com/one/free-api", "one"),
+                        _gh_result(202, "two/free-api", "https://github.com/two/free-api", "two"),
+                    ],
+                    "incomplete_results": False,
+                }
+            ]
+        }
+    )
+    collector = GitHubCollector(http=http, queries=["q"], per_page=10, max_total=50)
+    store = CandidateStore(tmp_path / "candidates.json")
+    summary = DiscoveryOrchestrator(store=store, collectors={"github": collector}).run(_run_context())
+
+    assert summary["store"]["candidates_created"] == 2
+    candidates = store.list_candidates()
+    assert len(candidates) == 2
+    assert {candidate.candidate_id for candidate in candidates} == {"github-101", "github-202"}
+    assert all(candidate.canonical_domain_hint is None for candidate in candidates)
+
+
 def test_one_collector_failure_others_succeed(tmp_path: Path) -> None:
     class Boom:
         def collect(self, query, ctx):

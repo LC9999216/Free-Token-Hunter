@@ -36,26 +36,38 @@ SUPPORTED_FIELDS = (
     "models",
 )
 
-# Enum fields may be returned as plain values; everything else needs grounding.
+# Every enum field is grounded too; ``value`` is the normalized enum value and
+# ``quote`` plus offsets point into the supplied evidence text.
 SCALAR_ENUM_FIELDS = ("offer_kind", "quota_mode", "renewal_period", "access_method")
 
 # offer_status is intentionally absent: deterministic code decides it.
 FORBIDDEN_MODEL_FIELDS = ("offer_status", "officiality", "verification_confidence", "free_score", "status")
 
+
+def _field_schema(is_enum: bool) -> dict:
+    properties = {
+        "evidence_id": {"type": "string"},
+        "quote": {"type": "string"},
+        "start_offset": {"type": "integer"},
+        "end_offset": {"type": "integer"},
+    }
+    required = ["evidence_id", "quote", "start_offset", "end_offset"]
+    if is_enum:
+        properties["value"] = {"type": "string"}
+        required.insert(0, "value")
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": required,
+    }
+
+
 EXTRACTION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        name: {
-            "type": "object",
-            "properties": {
-                "evidence_id": {"type": "string"},
-                "quote": {"type": "string"},
-                "start_offset": {"type": "integer"},
-                "end_offset": {"type": "integer"},
-            },
-            "required": ["quote", "start_offset", "end_offset"],
-        }
+        name: _field_schema(name in SCALAR_ENUM_FIELDS)
         for name in SUPPORTED_FIELDS
         if name != "models"
     }
@@ -82,10 +94,11 @@ def build_extraction_prompt(evidence_id: str, evidence_text: str) -> str:
     return (
         "Return JSON with ONLY these supported fields: "
         + ", ".join(SUPPORTED_FIELDS)
-        + ". Enum fields (offer_kind, quota_mode, renewal_period, access_method) "
-        "may be plain values. Every OTHER non-null field must be an object "
-        '{"evidence_id", "quote", "start_offset", "end_offset"} pointing exactly '
-        "into the EVIDENCE TEXT below (models is a list of such objects). "
+        + ". Every non-null field must be an object "
+        '{"value", "evidence_id", "quote", "start_offset", "end_offset"} '
+        "for enum fields, or {"
+        '"evidence_id", "quote", "start_offset", "end_offset"} for other fields, '
+        "pointing exactly into the EVIDENCE TEXT below (models is a list of such objects). "
         "You must not decide source officiality, contradictions, confidence "
         "scores, or provider state.\n"
         "EVIDENCE ID: " + evidence_id + "\n"

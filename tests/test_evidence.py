@@ -28,6 +28,7 @@ from hunter.evidence.models import (
 )
 from hunter.evidence.resolver import EvidenceResolver
 from hunter.evidence.store import EvidenceStore
+from hunter.evidence.validator import OfficialEvidenceValidator
 
 # --- host / address policy --------------------------------------------------
 
@@ -493,6 +494,115 @@ def test_fetcher_public_to_private_redirect_rejected() -> None:
         _fetcher(transport).fetch("https://public.example/start", provider_id="p1")
 
 
+def test_fetcher_relative_redirect_uses_lowercase_location() -> None:
+    class LowercaseRedirectTransport(FakeSocketTransport):
+        def request(self, url):
+            if url == "https://example.com/start":
+                self.requests.append(url)
+                return (302, {"location": "next"}, b"")
+            return super().request(url)
+
+    transport = LowercaseRedirectTransport(
+        responses={"https://example.com/next": (200, {"content-type": "text/plain"}, b"ok")}
+    )
+    result = _fetcher(transport).fetch("https://example.com/start", provider_id="p1")
+    assert result.final_url == "https://example.com/next"
+    assert transport.requests == ["https://example.com/start", "https://example.com/next"]
+
+
+def test_fetcher_uses_connection_class_for_url_scheme(monkeypatch) -> None:
+    import http.client
+
+    connections = []
+
+    class Response:
+        status = 200
+
+        def __init__(self):
+            self._read = False
+
+        def getheaders(self):
+            return [("Content-Type", "text/plain")]
+
+        def read(self, size=-1):
+            if self._read:
+                return b""
+            self._read = True
+            return b"ok"
+
+    class Connection:
+        def __init__(self, host, port, timeout):
+            connections.append((type(self).__name__, host, port, timeout))
+
+        def request(self, method, url):
+            assert method == "GET"
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            pass
+
+    class HttpConnection(Connection):
+        pass
+
+    class HttpsConnection(Connection):
+        pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", HttpConnection)
+    monkeypatch.setattr(http.client, "HTTPSConnection", HttpsConnection)
+    fetcher = SafeFetcher(max_body_bytes=10)
+    fetcher._real_request("example.com", 80, "http://example.com/x", 1, "http")
+    fetcher._real_request("example.com", 443, "https://example.com/x", 1, "https")
+    assert [entry[0] for entry in connections] == ["HttpConnection", "HttpsConnection"]
+
+
+def test_fetcher_streaming_body_is_bounded() -> None:
+    class ChunkedBody:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+            self.read_sizes = []
+
+        def read(self, size=-1):
+            self.read_sizes.append(size)
+            if size < 0:
+                size = len(self._payload)
+            chunk, self._payload = self._payload[:size], self._payload[size:]
+            return chunk
+
+    body = ChunkedBody(b"x" * 11)
+    transport = FakeSocketTransport(
+        responses={"https://example.com/stream": (200, {"content-type": "text/plain"}, body)}
+    )
+    with pytest.raises(FetcherError, match="size limit"):
+        _fetcher(transport, max_body_bytes=8).fetch("https://example.com/stream", provider_id="p1")
+    assert body.read_sizes
+    assert max(body.read_sizes) <= 9
+
+
+def test_fetcher_checks_content_type_before_reading_body() -> None:
+    class UnreadBody:
+        read_calls = 0
+
+        def read(self, size=-1):
+            self.read_calls += 1
+            return b"binary"
+
+    body = UnreadBody()
+    transport = FakeSocketTransport(
+        responses={
+            "https://example.com/file": (
+                200,
+                {"Content-Type": "application/octet-stream"},
+                body,
+            )
+        }
+    )
+    with pytest.raises(FetcherError, match="content type"):
+        _fetcher(transport).fetch("https://example.com/file", provider_id="p1")
+    assert body.read_calls == 0
+
+
 def test_fetcher_redirect_limit() -> None:
     redirects = {
         "https://a.example/1": "https://a.example/2",
@@ -653,6 +763,45 @@ def test_resolver_covers_document_kinds() -> None:
         kinds.add(_kind_from_url(url))
     assert {"pricing", "api-docs"} <= kinds
     assert len(urls) <= 10
+
+
+def test_resolver_includes_asserted_docs_url_as_fetch_target() -> None:
+    resolver = EvidenceResolver()
+    urls = resolver.propose_urls(
+        candidate_domain="other.example",
+        observations=[
+            {
+                "raw_metadata": {"asserted_docs_url": "https://acme.ai/special-offer"},
+            }
+        ],
+    )
+    assert "https://acme.ai/special-offer" in urls
+
+
+def test_equal_priority_identical_official_content_is_consistent() -> None:
+    first = Evidence(
+        evidence_id="ev-first",
+        provider_id="acme",
+        url="https://acme.ai/pricing",
+        source_type="pricing",
+        officiality=Officiality.OFFICIAL,
+        retrieved_at="2026-09-01T00:00:00+00:00",
+        claim="free plan programmatic API",
+        content_excerpt="free plan programmatic API",
+    )
+    second = Evidence(
+        evidence_id="ev-second",
+        provider_id="acme",
+        url="https://acme.ai/plans",
+        source_type="pricing",
+        officiality=Officiality.OFFICIAL,
+        retrieved_at="2026-09-01T00:00:00+00:00",
+        claim="free plan programmatic API",
+        content_excerpt="free plan programmatic API",
+    )
+    decision = OfficialEvidenceValidator([]).resolve_contradictions([first, second])
+    assert decision["unresolved"] == []
+    assert decision["winner"].evidence_id in {"ev-first", "ev-second"}
 
 
 def _kind_from_url(url: str) -> str:

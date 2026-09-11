@@ -336,12 +336,15 @@ class OfficialEvidenceValidator:
             pub = e.published_at or datetime.min.replace(tzinfo=timezone.utc)
             return (eff, pub)
 
+        def _content_key(e: Evidence):
+            return (e.claim or "", e.content_excerpt or "")
+
         winner = max(top, key=_sort_key)
         unresolved: List[str] = []
         for e in top:
             if e is winner:
                 continue
-            if _sort_key(e) == _sort_key(winner):
+            if _sort_key(e) == _sort_key(winner) and _content_key(e) != _content_key(winner):
                 unresolved.append(
                     f"equal-priority conflict between {e.evidence_id} and {winner.evidence_id}"
                 )

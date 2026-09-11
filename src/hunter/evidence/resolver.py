@@ -41,10 +41,22 @@ class EvidenceResolver:
 
         # From observations: explicit doc URLs and repository homepages.
         for obs in observations or []:
-            for key in ("docs_url", "url", "html_url", "homepage"):
-                value = obs.get(key) if isinstance(obs, dict) else None
-                if isinstance(value, str) and value.startswith(("http://", "https://")):
-                    add(value)
+            raw_metadata = obs.get("raw_metadata") if isinstance(obs, dict) else None
+            candidates = [obs, raw_metadata] if isinstance(raw_metadata, dict) else [obs]
+            for source in candidates:
+                if not isinstance(source, dict):
+                    continue
+                for key in (
+                    "docs_url",
+                    "asserted_docs_url",
+                    "upstream_docs_url",
+                    "url",
+                    "html_url",
+                    "homepage",
+                ):
+                    value = source.get(key)
+                    if isinstance(value, str) and value.startswith(("http://", "https://")):
+                        add(value)
 
         # From domain: common document paths.
         if candidate_domain:

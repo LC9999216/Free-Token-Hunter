@@ -11,7 +11,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from .models import (
     Evidence,
@@ -46,6 +46,22 @@ class EvidenceStore:
 
     def get(self, evidence_id: str) -> Optional[Evidence]:
         return self._items.get(evidence_id)
+
+    def remove_exact_ids(self, evidence_ids: Sequence[str]) -> List[str]:
+        """Remove only the explicitly named evidence records.
+
+        This narrow operation is reserved for audited data repair.  It never
+        selects records by provider, URL, source type, or other broad
+        predicates.
+        """
+        targets = set(evidence_ids)
+        removed = sorted(evidence_id for evidence_id in self._items if evidence_id in targets)
+        if not removed:
+            return []
+        for evidence_id in removed:
+            del self._items[evidence_id]
+        self.save()
+        return removed
 
     def find_by_url_fingerprint(self, url: str, fingerprint: str) -> Optional[Evidence]:
         canonical = canonicalize_evidence_url(url)

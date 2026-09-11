@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from ..collectors.github import GitHubCollector
 from .deduplicator import deduplicate_observations
-from .models import CandidateObservation
+from .models import CandidateObservation, SourceType
 from .store import CandidateStore, ObservationWithCandidate
 
 
@@ -85,6 +85,7 @@ class DiscoveryOrchestrator:
         entries = [
             ObservationWithCandidate(
                 observation=obs,
+                candidate_id=_github_candidate_id(obs),
                 provider_name=obs.source_title,
                 canonical_domain_hint=_identity_domain(obs),
             )
@@ -136,6 +137,12 @@ def _identity_domain(obs: CandidateObservation) -> Optional[str]:
     the linked provider URL; otherwise fall back to the source URL host.
     """
     meta = obs.raw_metadata or {}
+    if obs.source_type is SourceType.github:
+        homepage = meta.get("github_homepage")
+        domain = _domain_from_url(str(homepage)) if homepage else None
+        if domain and domain not in {"github.com", "www.github.com"}:
+            return domain
+        return None
     for key in ("asserted_docs_url", "hn_link", "provider_url"):
         value = meta.get(key)
         if value:
@@ -143,3 +150,10 @@ def _identity_domain(obs: CandidateObservation) -> Optional[str]:
             if domain:
                 return domain
     return _domain_from_url(obs.source_url)
+
+
+def _github_candidate_id(obs: CandidateObservation) -> Optional[str]:
+    if obs.source_type is not SourceType.github:
+        return None
+    candidate_id = (obs.raw_metadata or {}).get("github_candidate_id")
+    return str(candidate_id) if candidate_id else None

@@ -15,7 +15,7 @@ import socket
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 MAX_REDIRECTS = 3
 MAX_BODY_BYTES = 2 * 1024 * 1024
@@ -124,17 +124,17 @@ class SafeFetcher:
             parsed = check_url(current)
             self._assert_public(parsed)
             status, headers, body = self._transact(parsed, start)
-            if status in (301, 302, 303, 307, 308) and "Location" in headers:
-                current = headers["Location"]
+            location = headers.get("location")
+            if status in (301, 302, 303, 307, 308) and location:
+                current = urljoin(current, location)
                 # redirect destination is revalidated from scratch
                 continue
             self._check_declared_length(headers)
-            self._check_content_type(headers, body)
-            if len(body) > self.max_body_bytes:
-                raise FetcherError("response body exceeds size limit")
+            self._check_content_type(headers)
+            body = self._read_limited(body)
             return FetchResult(
                 status=status,
-                headers=dict(headers),
+                headers=headers,
                 body=body,
                 final_url=current,
             )
@@ -164,30 +164,42 @@ class SafeFetcher:
             result = self.transport.request(url)
             if time.monotonic() - start > self.total_timeout:
                 raise FetcherError("total request timeout exceeded")
-            return result
-        return self._real_request(host, port, url, remaining)
+            status, headers, body = result
+            normalized_headers = {
+                str(key).lower(): str(value) for key, value in dict(headers).items()
+            }
+            return status, normalized_headers, body
+        return self._real_request(host, port, url, remaining, parsed.scheme)
 
-    def _real_request(self, host, port, url, timeout) -> tuple[int, Dict[str, str], bytes]:
+    def _real_request(
+        self, host, port, url, timeout, scheme=None
+    ) -> tuple[int, Dict[str, str], bytes]:
         # Deliberately simple: no cookies, no auth, no scripts.
         import http.client
 
-        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+        scheme = scheme or urlparse(url).scheme
+        connection_class = (
+            http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        )
+        conn = connection_class(host, port, timeout=timeout)
         try:
             conn.request("GET", url)
             response = conn.getresponse()
-            headers = {k.lower(): v for k, v in response.getheaders()}
-            body = response.read()
+            headers = {str(k).lower(): str(v) for k, v in response.getheaders()}
+            self._check_declared_length(headers)
+            self._check_content_type(headers)
+            body = self._read_limited(response)
             return (response.status, headers, body)
         finally:
             conn.close()
 
-    def _check_content_type(self, headers, body) -> None:
-        ctype = (headers.get("Content-Type") or headers.get("content-type") or "").lower().split(";")[0].strip()
+    def _check_content_type(self, headers) -> None:
+        ctype = str(headers.get("content-type") or "").lower().split(";")[0].strip()
         if ctype and ctype not in ACCEPTED_CONTENT_TYPES:
             raise FetcherError(f"unsupported content type {ctype!r}")
 
     def _check_declared_length(self, headers) -> None:
-        raw = headers.get("Content-Length") or headers.get("content-length")
+        raw = headers.get("content-length")
         if raw is None:
             return
         try:
@@ -196,6 +208,51 @@ class SafeFetcher:
             return
         if declared > self.max_body_bytes:
             raise FetcherError(f"declared Content-Length {declared} exceeds size limit")
+
+    def _read_limited(self, body) -> bytes:
+        """Read at most max_body_bytes + 1 bytes so overflow fails closed."""
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            data = bytes(body)
+            if len(data) > self.max_body_bytes:
+                raise FetcherError("response body exceeds size limit")
+            return data
+
+        chunks: List[bytes] = []
+        total = 0
+        read = getattr(body, "read", None)
+        if callable(read):
+            while total <= self.max_body_bytes:
+                size = min(64 * 1024, self.max_body_bytes + 1 - total)
+                try:
+                    chunk = read(size)
+                except Exception as exc:  # noqa: BLE001 - response read failure
+                    raise FetcherError("response body read failed") from exc
+                if not chunk:
+                    break
+                try:
+                    chunk = bytes(chunk)
+                except (TypeError, ValueError) as exc:
+                    raise FetcherError("response body is not bytes") from exc
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > self.max_body_bytes:
+                    raise FetcherError("response body exceeds size limit")
+            return b"".join(chunks)
+
+        try:
+            iterator = iter(body)
+        except TypeError as exc:
+            raise FetcherError("response body is not readable") from exc
+        for chunk in iterator:
+            try:
+                chunk = bytes(chunk)
+            except (TypeError, ValueError) as exc:
+                raise FetcherError("response body is not bytes") from exc
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > self.max_body_bytes:
+                raise FetcherError("response body exceeds size limit")
+        return b"".join(chunks)
 
     def _bump_page_count(self, provider_id: str) -> None:
         count = self._page_counts.get(provider_id, 0)

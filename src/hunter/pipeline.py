@@ -1,31 +1,35 @@
-"""End-to-end offline pipeline (TASK-010).
+"""End-to-end stage-one pipeline (TASK-010).
 
 Deterministic given the same seed fixture, config, and explicit ``as_of``:
   import seed -> candidates
-  -> build evidence from asserted doc URLs
+  -> resolve and fetch candidate evidence URLs
   -> validate officiality via trust anchors
-  -> deterministic extraction from structured seed facts
+  -> grounded extraction through an injected LLM boundary
   -> scores
   -> confirm FREE_CONFIRMED providers through confirm_provider()
 
 Running twice with identical inputs produces a byte-identical Registry and no
-new no-op History events. No network, no LLM, no system clock.
+new no-op History events. The default missing extractor fails closed.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .collectors.registry_seed import RegistrySeedImporter
-from .config import DEFAULT_CONFIG_DIR, load_settings, load_sources
-from .discovery.models import SourceType
+from .config import DEFAULT_CONFIG_DIR, load_sources
 from .discovery.store import CandidateStore
+from .evidence.fetcher import SafeFetcher
 from .evidence.models import Evidence
+from .evidence.resolver import EvidenceResolver
 from .evidence.store import EvidenceStore
-from .evidence.validator import OfficialEvidenceValidator, load_trust_anchors
+from .evidence.validator import (
+    ContradictionError,
+    OfficialEvidenceValidator,
+    load_trust_anchors,
+)
 from .llm.models import ExtractionResult
 from .registry.confirmation import ConfirmationError, ConfirmationInput, confirm_provider
 from .registry.schema import ProviderStatus
@@ -44,6 +48,9 @@ class Pipeline:
         as_of: Optional[datetime] = None,
         scoring_path: Optional[Path] = None,
         sources_path: Optional[Path] = None,
+        resolver: Optional[EvidenceResolver] = None,
+        fetcher: Optional[SafeFetcher] = None,
+        extractor: Any = None,
     ):
         self.data_dir = Path(data_dir)
         self.seed_path = Path(seed_path) if seed_path else None
@@ -62,6 +69,12 @@ class Pipeline:
         anchors = load_trust_anchors(self.sources_path)
         self.validator = OfficialEvidenceValidator(anchors=anchors)
         self.scoring_config = load_scoring_config(self.scoring_path)
+        self.resolver = resolver or EvidenceResolver()
+        self.fetcher = fetcher or SafeFetcher()
+        self.extractor = extractor
+        self._resolved_evidence: Dict[str, Evidence] = {}
+        self._unresolved_contradictions: Dict[str, List[str]] = {}
+        self._resolution_ready = False
 
     # --- step 1: import seed -------------------------------------------------
 
@@ -83,29 +96,37 @@ class Pipeline:
     # --- step 2: build evidence ---------------------------------------------
 
     def build_evidence(self) -> int:
-        """Create Evidence records from asserted doc URLs (deterministic)."""
+        """Resolve, fetch, and persist evidence from HTTP responses only."""
         created = 0
         for candidate in self.candidate_store.list_candidates():
-            for obs in candidate.observations:
-                docs_url = (obs.raw_metadata or {}).get("asserted_docs_url")
-                url = docs_url if isinstance(docs_url, str) and docs_url.startswith("http") else None
-                if not url:
+            observations = [obs.model_dump(mode="json") for obs in candidate.observations]
+            urls = self.resolver.propose_urls(
+                candidate_domain=candidate.canonical_domain_hint,
+                observations=observations,
+            )
+            for url in urls:
+                try:
+                    result = self.fetcher.fetch(url, provider_id=candidate.candidate_id)
+                except Exception:  # noqa: BLE001 - one URL must not stop a candidate
                     continue
-                source_type = _guess_source_type(url)
-                claim = (obs.raw_metadata or {}).get("asserted_free_tier") or obs.claim or ""
+                if not 200 <= result.status < 300:
+                    continue
+                text = result.body.decode("utf-8", errors="replace")
+                excerpt = _plain_text_excerpt(text)[:4000]
+                final_url = result.final_url or url
                 evidence = Evidence(
                     candidate_id=candidate.candidate_id,
                     provider_id=candidate.candidate_id,
-                    url=url,
-                    source_type=source_type,
+                    url=final_url,
+                    source_type=_guess_source_type(final_url),
                     retrieved_at=self.as_of,
-                    effective_at=self.as_of,
-                    title=obs.source_title,
-                    claim=str(claim)[:300],
-                    content_excerpt=str(obs.claim or "")[:4000],
+                    title=final_url,
+                    claim=excerpt[:300],
+                    content_excerpt=excerpt,
                 )
                 if self.evidence_store.upsert(evidence):
                     created += 1
+        self._resolution_ready = False
         return created
 
     # --- step 3: validate officiality ----------------------------------------
@@ -116,49 +137,49 @@ class Pipeline:
             validated = self.validator.validate(evidence)
             counts[validated.officiality.value] = counts.get(validated.officiality.value, 0) + 1
             self.evidence_store.upsert(validated)
+        self._resolution_ready = False
         return counts
+
+    def resolve_contradictions(self) -> Dict[str, int]:
+        """Resolve validated evidence before extraction or scoring."""
+        resolved: Dict[str, Evidence] = {}
+        unresolved: Dict[str, List[str]] = {}
+        for candidate in self.candidate_store.list_candidates():
+            items = [
+                evidence
+                for evidence in self.evidence_store.list()
+                if evidence.candidate_id == candidate.candidate_id
+            ]
+            if not items:
+                continue
+            try:
+                decision = self.validator.resolve_contradictions(items)
+            except ContradictionError as exc:
+                unresolved[candidate.candidate_id] = [str(exc)]
+                continue
+            if decision["unresolved"]:
+                unresolved[candidate.candidate_id] = list(decision["unresolved"])
+                continue
+            resolved[candidate.candidate_id] = decision["winner"]
+        self._resolved_evidence = resolved
+        self._unresolved_contradictions = unresolved
+        self._resolution_ready = True
+        return {"resolved": len(resolved), "unresolved": len(unresolved)}
 
     # --- step 4: extraction --------------------------------------------------
 
     def _extraction_for(self, candidate_id: str) -> Optional[ExtractionResult]:
-        candidate = self.candidate_store.get(candidate_id)
-        if candidate is None:
+        evidence = self._resolved_evidence.get(candidate_id)
+        if evidence is None or self.extractor is None:
             return None
-        hints: Dict[str, Any] = {}
-        asserted: Dict[str, Any] = {}
-        for obs in candidate.observations:
-            meta = obs.raw_metadata or {}
-            hints.update(meta.get("offer_hints") or {})
-            for key in (
-                "asserted_phone_required",
-                "asserted_card_required",
-                "asserted_commercial_ok",
-                "asserted_openai_compatible",
-                "asserted_openai_base_url",
-                "asserted_env_key",
-            ):
-                if meta.get(key) is not None:
-                    asserted[key.replace("asserted_", "")] = meta[key]
-        return ExtractionResult(
-            ok=True,
-            offer_kind=hints.get("offer_kind"),
-            quota_mode=hints.get("quota_mode"),
-            renewal_period=hints.get("renewal_period"),
-            access_method=hints.get("access_method"),
-            offer_status=None,
-            card_required=_bool_or_none(asserted.get("card_required")),
-            phone_required=_bool_or_none(asserted.get("phone_required")),
-            commercial_use_allowed=_bool_or_none(asserted.get("commercial_ok")),
-            openai_compatible=_bool_or_none(asserted.get("openai_compatible")),
-            base_url=asserted.get("openai_base_url"),
-            description=None,
-            quota_text=None,
-        )
+        return self.extractor.extract(evidence, as_of=self.as_of.isoformat())
 
     # --- step 5+6: score and confirm -----------------------------------------
 
     def score_and_confirm(self) -> Dict[str, int]:
         """Score each candidate and confirm when every hard gate passes."""
+        if not self._resolution_ready:
+            self.resolve_contradictions()
         outcomes = {
             "free_confirmed": 0,
             "providers_created": 0,
@@ -176,6 +197,10 @@ class Pipeline:
                 if not evidence_items:
                     outcomes["unchanged"] += 1
                     continue
+                winner = self._resolved_evidence.get(candidate.candidate_id)
+                if winner is None or candidate.candidate_id in self._unresolved_contradictions:
+                    outcomes["unchanged"] += 1
+                    continue
                 extraction = self._extraction_for(candidate.candidate_id)
                 if extraction is None or not extraction.ok:
                     # ungrounded extraction: recorded, retryable, not confirmed
@@ -186,23 +211,22 @@ class Pipeline:
                     provider_id
                 ) or self.registry.find_by_domain(candidate.canonical_domain_hint)
                 vc = verification_confidence(evidence_items, self.scoring_config, self.as_of)
-                requirements = _requirements_for(candidate)
-                api = _api_for(candidate)
+                requirements = _requirements_for(extraction)
+                api = _api_for(extraction)
                 fs = free_score(
-                    _offer_from_hints(_offer_hints_for(candidate), extraction),
+                    _offer_from_extraction(extraction),
                     requirements,
                     api,
-                    models=_models_for(candidate),
-                    has_documented_limits=_has_limits(candidate),
+                    models=_models_for(extraction),
+                    has_documented_limits=False,
                     _config=self.scoring_config,
                     as_of=self.as_of,
                 )
-                best = max(evidence_items, key=lambda e: (e.effective_at or e.retrieved_at))
                 confirmed = confirm_provider(
                     ConfirmationInput(
                         provider_name=candidate.provider_name or candidate.candidate_id,
                         canonical_domain=candidate.canonical_domain_hint or "",
-                        evidence=best,
+                        evidence=winner,
                         extraction=extraction,
                         verification_confidence=vc,
                         free_score=fs,
@@ -212,6 +236,13 @@ class Pipeline:
                             "as_of": self.as_of.isoformat(),
                         },
                         reason="stage-one pipeline confirmation from anchored official evidence",
+                        models=_models_for(extraction),
+                        has_documented_limits=False,
+                        official_docs=[
+                            evidence.url
+                            for evidence in evidence_items
+                            if evidence.officiality.value == "OFFICIAL"
+                        ],
                     ),
                     self.registry,
                     self.validator,
@@ -241,6 +272,7 @@ class Pipeline:
         candidates = self.candidate_store.list_candidates()
         evidence_built = self.build_evidence()
         validation = self.validate_evidence()
+        contradictions = self.resolve_contradictions()
         outcomes = self.score_and_confirm()
 
         status_counts = {
@@ -270,6 +302,7 @@ class Pipeline:
                 "import_seed": seed_summary,
                 "evidence_built": evidence_built,
                 "validation": validation,
+                "contradictions": contradictions,
                 "providers": len(self.registry.list_providers()),
             },
         }
@@ -305,101 +338,74 @@ def _guess_source_type(url: str) -> str:
     return "page"
 
 
-def _bool_or_none(value: Any) -> Optional[bool]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    lowered = str(value).strip().lower()
-    if lowered in ("true", "yes", "1", "y"):
-        return True
-    if lowered in ("false", "no", "0", "n"):
-        return False
-    return None
-
-
-def _offer_hints_for(candidate) -> Dict[str, Any]:
-    hints: Dict[str, Any] = {}
-    for obs in candidate.observations:
-        hints.update((obs.raw_metadata or {}).get("offer_hints") or {})
-    return hints
-
-
-def _requirements_for(candidate):
+def _requirements_for(extraction: ExtractionResult):
     from .registry.schema import ProviderRequirements
 
-    asserted: Dict[str, Any] = {}
-    for obs in candidate.observations:
-        meta = obs.raw_metadata or {}
-        for key, target in (
-            ("asserted_phone_required", "phone_required"),
-            ("asserted_card_required", "card_required"),
-            ("asserted_commercial_ok", "commercial_use_allowed"),
-        ):
-            if meta.get(key) is not None:
-                asserted[target] = _bool_or_none(meta[key])
-    regional = _regional_for(candidate)
     return ProviderRequirements(
-        signup_required=None,
-        phone_required=asserted.get("phone_required"),
-        card_required=asserted.get("card_required"),
-        commercial_use_allowed=asserted.get("commercial_use_allowed"),
-        regional_restrictions=regional,
+        signup_required=extraction.signup_required,
+        phone_required=extraction.phone_required,
+        card_required=extraction.card_required,
+        commercial_use_allowed=extraction.commercial_use_allowed,
+        regional_restrictions=None,
     )
 
 
-def _regional_for(candidate) -> Optional[str]:
-    for obs in candidate.observations:
-        meta = obs.raw_metadata or {}
-        if meta.get("asserted_regional_restrictions"):
-            return str(meta["asserted_regional_restrictions"])
-    return None
-
-
-def _api_for(candidate):
+def _api_for(extraction: ExtractionResult):
     from .registry.schema import ProviderApi
 
-    api = ProviderApi()
-    for obs in candidate.observations:
-        meta = obs.raw_metadata or {}
-        if meta.get("asserted_openai_base_url"):
-            api.base_url = str(meta["asserted_openai_base_url"])
-        if meta.get("asserted_openai_compatible") is not None:
-            api.openai_compatible = _bool_or_none(meta["asserted_openai_compatible"])
-    return api
+    return ProviderApi(
+        base_url=extraction.base_url,
+        openai_compatible=extraction.openai_compatible,
+    )
 
 
-def _models_for(candidate) -> List[str]:
-    models: List[str] = []
-    for obs in candidate.observations:
-        meta = obs.raw_metadata or {}
-        raw = meta.get("asserted_models_free")
-        if isinstance(raw, list):
-            models.extend(str(m) for m in raw)
+def _models_for(extraction: ExtractionResult) -> List[str]:
+    models = [str(model) for model in extraction.models]
     seen = set()
     return [m for m in models if not (m in seen or seen.add(m))]
 
 
-def _has_limits(candidate) -> bool:
-    for obs in candidate.observations:
-        meta = obs.raw_metadata or {}
-        if meta.get("asserted_rate_limits"):
-            return True
-    return False
+def _offer_from_extraction(extraction: ExtractionResult):
+    from .registry.schema import (
+        AccessMethod,
+        FreeOffer,
+        OfferKind,
+        OfferStatus,
+        QuotaMode,
+        RenewalPeriod,
+    )
 
-
-def _offer_from_hints(hints: Dict[str, Any], extraction: ExtractionResult):
-    from .registry.schema import FreeOffer, OfferKind, OfferStatus
-
-    offer_kind = extraction.offer_kind or hints.get("offer_kind")
     try:
-        kind = OfferKind(offer_kind) if offer_kind else OfferKind.unknown
+        kind = OfferKind(extraction.offer_kind) if extraction.offer_kind else OfferKind.unknown
     except ValueError:
         kind = OfferKind.unknown
+    try:
+        quota = QuotaMode(extraction.quota_mode) if extraction.quota_mode else QuotaMode.unknown
+    except ValueError:
+        quota = QuotaMode.unknown
+    try:
+        renewal = RenewalPeriod(extraction.renewal_period) if extraction.renewal_period else None
+    except ValueError:
+        renewal = None
+    try:
+        access = AccessMethod(extraction.access_method) if extraction.access_method else AccessMethod.unknown
+    except ValueError:
+        access = AccessMethod.unknown
     return FreeOffer(
         offer_kind=kind,
-        offer_status=OfferStatus.active,  # will be recomputed by confirmation
+        quota_mode=quota,
+        renewal_period=renewal,
+        access_method=access,
+        offer_status=OfferStatus.unknown,
         description=extraction.description,
         quota_text=extraction.quota_text,
         expires_at=extraction.expires_at,
     )
+
+
+def _plain_text_excerpt(text: str) -> str:
+    import re
+
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()

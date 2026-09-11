@@ -9,6 +9,7 @@ access is fully injectable so tests stay offline.
 from __future__ import annotations
 
 import json
+import re
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -98,6 +99,8 @@ class GitHubCollector:
             return None
         description = item.get("description")
         claim = (description or "").strip() or f"{full_name} may offer free AI API access"
+        stable_id = str(item.get("id") or full_name).strip().lower()
+        stable_id = re.sub(r"[^a-z0-9]+", "-", stable_id).strip("-")
         run_ts = run_context.run_timestamp
         try:
             discovered_at = datetime.fromisoformat(run_ts)
@@ -113,8 +116,10 @@ class GitHubCollector:
             discovered_at=discovered_at,
             raw_metadata={
                 "github_full_name": full_name,
+                "github_candidate_id": f"github-{stable_id}",
                 "github_owner": full_name.split("/", 1)[0] if "/" in full_name else None,
                 "github_html_url": html_url,
+                "github_homepage": item.get("homepage"),
                 "stargazers_count": item.get("stargazers_count"),
                 "fork": bool(item.get("fork")),
                 "language": item.get("language"),
