@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from hunter.pipeline import Pipeline
+from tests.fakes import FakeFetcher, FakeGroundedExtractor
 
 FIXTURE = Path("tests/fixtures/upstream/free-llm-api-hub-v2.9.0.json")
 AS_OF = datetime(2026, 9, 1, tzinfo=timezone.utc)
@@ -16,6 +17,8 @@ def _pipeline(tmp_path: Path) -> Pipeline:
         data_dir=tmp_path / "data",
         seed_path=FIXTURE,
         as_of=AS_OF,
+        fetcher=FakeFetcher(),
+        extractor=FakeGroundedExtractor(),
     )
 
 
@@ -47,13 +50,25 @@ def test_pipeline_runs_end_to_end(tmp_path: Path) -> None:
 
 def test_pipeline_twice_is_byte_identical(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
-    p1 = Pipeline(data_dir=data_dir, seed_path=FIXTURE, as_of=AS_OF)
+    p1 = Pipeline(
+        data_dir=data_dir,
+        seed_path=FIXTURE,
+        as_of=AS_OF,
+        fetcher=FakeFetcher(),
+        extractor=FakeGroundedExtractor(),
+    )
     s1 = p1.run()
     providers1 = (data_dir / "providers.json").read_bytes()
     history1 = (data_dir / "history.jsonl").read_text(encoding="utf-8")
     history_lines1 = [l for l in history1.splitlines() if l.strip()]
 
-    p2 = Pipeline(data_dir=data_dir, seed_path=FIXTURE, as_of=AS_OF)
+    p2 = Pipeline(
+        data_dir=data_dir,
+        seed_path=FIXTURE,
+        as_of=AS_OF,
+        fetcher=FakeFetcher(),
+        extractor=FakeGroundedExtractor(),
+    )
     s2 = p2.run()
     providers2 = (data_dir / "providers.json").read_bytes()
     history2 = (data_dir / "history.jsonl").read_text(encoding="utf-8")
@@ -76,12 +91,24 @@ def test_pipeline_deterministic_hashes(tmp_path: Path) -> None:
     import hashlib
 
     data_dir = tmp_path / "data"
-    p1 = Pipeline(data_dir=data_dir, seed_path=FIXTURE, as_of=AS_OF)
+    p1 = Pipeline(
+        data_dir=data_dir,
+        seed_path=FIXTURE,
+        as_of=AS_OF,
+        fetcher=FakeFetcher(),
+        extractor=FakeGroundedExtractor(),
+    )
     p1.run()
     h1 = hashlib.sha256((data_dir / "providers.json").read_bytes()).hexdigest()
 
     data_dir2 = tmp_path / "data2"
-    p2 = Pipeline(data_dir=data_dir2, seed_path=FIXTURE, as_of=AS_OF)
+    p2 = Pipeline(
+        data_dir=data_dir2,
+        seed_path=FIXTURE,
+        as_of=AS_OF,
+        fetcher=FakeFetcher(),
+        extractor=FakeGroundedExtractor(),
+    )
     p2.run()
     h2 = hashlib.sha256((data_dir2 / "providers.json").read_bytes()).hexdigest()
     assert h1 == h2

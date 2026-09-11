@@ -20,7 +20,7 @@ import pytest
 
 from hunter.evidence.models import Evidence, Officiality
 from hunter.evidence.validator import OfficialEvidenceValidator, TrustAnchor
-from hunter.llm.models import ExtractionResult
+from hunter.llm.models import ExtractionResult, GroundedField
 from hunter.pipeline import Pipeline
 from hunter.registry.confirmation import (
     ConfirmationError,
@@ -38,6 +38,7 @@ from hunter.registry.store import ProviderRegistry
 from hunter.scoring.config import load_scoring_config
 from hunter.scoring.free_score import free_score
 from hunter.scoring.confidence import verification_confidence
+from tests.fakes import FakeFetcher, FakeGroundedExtractor
 
 FIXTURE = Path("tests/fixtures/upstream/free-llm-api-hub-v2.9.0.json")
 AS_OF = datetime(2026, 9, 1, tzinfo=timezone.utc)
@@ -45,7 +46,13 @@ SCORING = load_scoring_config(Path("config/scoring.yaml"))
 
 
 def _pipeline(tmp_path: Path) -> Pipeline:
-    return Pipeline(data_dir=tmp_path / "data", seed_path=FIXTURE, as_of=AS_OF)
+    return Pipeline(
+        data_dir=tmp_path / "data",
+        seed_path=FIXTURE,
+        as_of=AS_OF,
+        fetcher=FakeFetcher(),
+        extractor=FakeGroundedExtractor(),
+    )
 
 
 # --- end-to-end offline fixture run -----------------------------------------
@@ -82,12 +89,24 @@ def test_stage_one_offline_end_to_end(tmp_path: Path) -> None:
 
 def test_stage_one_second_run_is_byte_identical(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
-    first = Pipeline(data_dir=data_dir, seed_path=FIXTURE, as_of=AS_OF)
+    first = Pipeline(
+        data_dir=data_dir,
+        seed_path=FIXTURE,
+        as_of=AS_OF,
+        fetcher=FakeFetcher(),
+        extractor=FakeGroundedExtractor(),
+    )
     s1 = first.run()
     providers_1 = (data_dir / "providers.json").read_bytes()
     history_1 = (data_dir / "history.jsonl").read_bytes()
 
-    second = Pipeline(data_dir=data_dir, seed_path=FIXTURE, as_of=AS_OF)
+    second = Pipeline(
+        data_dir=data_dir,
+        seed_path=FIXTURE,
+        as_of=AS_OF,
+        fetcher=FakeFetcher(),
+        extractor=FakeGroundedExtractor(),
+    )
     s2 = second.run()
     providers_2 = (data_dir / "providers.json").read_bytes()
     history_2 = (data_dir / "history.jsonl").read_bytes()
@@ -102,9 +121,21 @@ def test_stage_one_second_run_is_byte_identical(tmp_path: Path) -> None:
 
 
 def test_stage_one_distinct_dirs_same_hash(tmp_path: Path) -> None:
-    a = Pipeline(data_dir=tmp_path / "a", seed_path=FIXTURE, as_of=AS_OF)
+    a = Pipeline(
+        data_dir=tmp_path / "a",
+        seed_path=FIXTURE,
+        as_of=AS_OF,
+        fetcher=FakeFetcher(),
+        extractor=FakeGroundedExtractor(),
+    )
     a.run()
-    b = Pipeline(data_dir=tmp_path / "b", seed_path=FIXTURE, as_of=AS_OF)
+    b = Pipeline(
+        data_dir=tmp_path / "b",
+        seed_path=FIXTURE,
+        as_of=AS_OF,
+        fetcher=FakeFetcher(),
+        extractor=FakeGroundedExtractor(),
+    )
     b.run()
     ha = hashlib.sha256((tmp_path / "a" / "providers.json").read_bytes()).hexdigest()
     hb = hashlib.sha256((tmp_path / "b" / "providers.json").read_bytes()).hexdigest()
@@ -115,7 +146,13 @@ def test_stage_one_third_run_still_stable(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     hashes = []
     for _ in range(3):
-        Pipeline(data_dir=data_dir, seed_path=FIXTURE, as_of=AS_OF).run()
+        Pipeline(
+            data_dir=data_dir,
+            seed_path=FIXTURE,
+            as_of=AS_OF,
+            fetcher=FakeFetcher(),
+            extractor=FakeGroundedExtractor(),
+        ).run()
         hashes.append(hashlib.sha256((data_dir / "providers.json").read_bytes()).hexdigest())
     assert len(set(hashes)) == 1
 
@@ -274,7 +311,30 @@ def _official_evidence() -> Evidence:
 
 
 def _extraction(**kw) -> ExtractionResult:
-    base = dict(ok=True, offer_kind="free_tier", access_method="api_key")
+    quote = "free plan programmatic API"
+    base = dict(
+        ok=True,
+        offer_kind="free_tier",
+        access_method="api_key",
+        grounded_fields=[
+            GroundedField(
+                field="offer_kind",
+                value="free_tier",
+                evidence_id="ev-acme",
+                quote="free plan",
+                start_offset=0,
+                end_offset=9,
+            ),
+            GroundedField(
+                field="access_method",
+                value="api_key",
+                evidence_id="ev-acme",
+                quote="programmatic API",
+                start_offset=10,
+                end_offset=len(quote),
+            ),
+        ],
+    )
     base.update(kw)
     return ExtractionResult(**base)
 
@@ -385,6 +445,32 @@ def test_missing_grounding_rejected(tmp_path: Path) -> None:
         )
 
 
+def test_unknown_offer_kind_never_confirms(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    validator = OfficialEvidenceValidator([_anchor()])
+    with pytest.raises(ConfirmationError, match="offer_kind"):
+        confirm_provider(
+            _input(extraction=ExtractionResult(ok=True)), registry, validator
+        )
+
+
+def test_confirmation_defensively_rejects_non_null_field_without_citation(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    validator = OfficialEvidenceValidator([_anchor()])
+    with pytest.raises(ConfirmationError, match="grounded"):
+        confirm_provider(
+            _input(
+                extraction=ExtractionResult(
+                    ok=True,
+                    offer_kind="free_tier",
+                    access_method="api_key",
+                )
+            ),
+            registry,
+            validator,
+        )
+
+
 def test_consumer_chat_only_offer_rejected(tmp_path: Path) -> None:
     """A free consumer chat UI without programmatic API scope cannot confirm."""
     registry = _registry(tmp_path)
@@ -396,6 +482,31 @@ def test_consumer_chat_only_offer_rejected(tmp_path: Path) -> None:
         openai_compatible=None,
         base_url=None,
         quota_text="free web chat",
+        grounded_fields=[
+            GroundedField(
+                field="offer_kind",
+                value="free_tier",
+                evidence_id="ev-chat",
+                quote="free web chat",
+                start_offset=0,
+                end_offset=13,
+            ),
+            GroundedField(
+                field="access_method",
+                value="unknown",
+                evidence_id="ev-chat",
+                quote="free web chat",
+                start_offset=0,
+                end_offset=13,
+            ),
+            GroundedField(
+                field="quota_text",
+                evidence_id="ev-chat",
+                quote="free web chat",
+                start_offset=0,
+                end_offset=13,
+            ),
+        ],
     )
     # no documented programmatic API scope in the evidence
     evidence = Evidence(

@@ -44,6 +44,17 @@ def _raw(field: str, quote: str, start: int, end: int, evidence_id: str = "ev-1"
     return {"field": field, "evidence_id": evidence_id, "quote": quote, "start_offset": start, "end_offset": end}
 
 
+def _enum(value: str, quote: str = "free tier", evidence_id: str = "ev-1") -> Dict[str, Any]:
+    start = PRICING_TEXT.index(quote)
+    return {
+        "value": value,
+        "evidence_id": evidence_id,
+        "quote": quote,
+        "start_offset": start,
+        "end_offset": start + len(quote),
+    }
+
+
 # --- grounding validation ---------------------------------------------------
 
 
@@ -121,7 +132,7 @@ def test_valid_extraction_accepted() -> None:
     llm = FakeLLM(
         [
             {
-                "offer_kind": "free_tier",
+                "offer_kind": _enum("free_tier"),
                 "quota_text": {"evidence_id": "ev-1", "quote": "free tier with 100,000 tokens", "start_offset": idx, "end_offset": end},
             }
         ]
@@ -132,6 +143,16 @@ def test_valid_extraction_accepted() -> None:
     assert llm.calls == 1
 
 
+def test_plain_enum_string_is_rejected() -> None:
+    llm = FakeLLM([{"offer_kind": "free_tier"}, {"offer_kind": "free_tier"}])
+
+    result = _extractor(llm).extract(_evidence(), as_of="2026-09-01T00:00:00+00:00")
+
+    assert result.ok is False
+    assert result.offer_kind is None
+    assert llm.calls == 2
+
+
 def test_ungrounded_output_rejected_and_repair_attempted() -> None:
     # First response is schema-valid but ungrounded; repair is one attempt.
     idx = PRICING_TEXT.index("credit card")
@@ -139,12 +160,12 @@ def test_ungrounded_output_rejected_and_repair_attempted() -> None:
     llm = FakeLLM(
         [
             {
-                "offer_kind": "free_tier",
+                "offer_kind": _enum("free_tier"),
                 "card_required": {"evidence_id": "ev-1", "quote": "credit card", "start_offset": idx, "end_offset": end},
                 "quota_text": {"evidence_id": "ev-1", "quote": "INVENTED quote", "start_offset": 0, "end_offset": 10},
             },
             {
-                "offer_kind": "free_tier",
+                "offer_kind": _enum("free_tier"),
                 "card_required": {"evidence_id": "ev-1", "quote": "credit card", "start_offset": idx, "end_offset": end},
             },
         ]
@@ -158,7 +179,7 @@ def test_malformed_output_rejected_and_repair_attempted() -> None:
     llm = FakeLLM(
         [
             "not json at all {{{",
-            {"offer_kind": "free_tier"},
+            {},
         ]
     )
     result = _extractor(llm).extract(_evidence(), as_of="2026-09-01T00:00:00+00:00")
@@ -214,7 +235,7 @@ def test_unsupported_field_ignored() -> None:
         [
             {
                 "totally_unsupported_field": "value",
-                "offer_kind": "free_tier",
+                "offer_kind": _enum("free_tier"),
             }
         ]
     )
@@ -290,7 +311,7 @@ def test_unknown_enum_rejected_not_coerced() -> None:
 
 
 def test_extra_fields_dropped() -> None:
-    llm = FakeLLM([{"made_up_field": "x", "another_one": 5, "offer_kind": "free_tier"}])
+    llm = FakeLLM([{"made_up_field": "x", "another_one": 5, "offer_kind": _enum("free_tier")}])
     result = _extractor(llm).extract(_evidence(), as_of="2026-09-01T00:00:00+00:00")
     assert result.ok is True
     assert result.offer_kind == "free_tier"

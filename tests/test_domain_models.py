@@ -217,6 +217,7 @@ def _obs(**overrides) -> CandidateObservation:
         source_title="Registry",
         claim="Free tier available",
         matched_query=None,
+        discovered_at="2026-09-01T00:00:00+00:00",
     )
     base.update(overrides)
     return CandidateObservation(**base)

@@ -24,6 +24,7 @@ from ..discovery.models import _require_aware_iso
 from ..evidence.models import Evidence, Officiality
 from ..evidence.validator import OfficialEvidenceValidator
 from ..llm.models import ExtractionResult
+from ..llm.structured_extractor import validate_grounding
 from ..registry.schema import (
     AccessMethod,
     FreeOffer,
@@ -81,6 +82,56 @@ def _has_programmatic_api_scope(evidence: "Evidence", extraction: "ExtractionRes
     return any(marker in text for marker in API_SCOPE_MARKERS)
 
 
+def _extraction_grounding_errors(
+    extraction: ExtractionResult, evidence: Evidence
+) -> List[str]:
+    """Defensively require citations for every non-null extracted field."""
+    try:
+        errors = validate_grounding(extraction.grounded_fields, [evidence])
+    except Exception as exc:  # noqa: BLE001 - malformed citations fail closed
+        return [f"invalid grounding structure: {exc}"]
+
+    scalar_fields = (
+        "offer_kind",
+        "quota_mode",
+        "renewal_period",
+        "access_method",
+        "description",
+        "quota_text",
+        "expires_at",
+        "card_required",
+        "phone_required",
+        "commercial_use_allowed",
+        "signup_required",
+        "openai_compatible",
+        "base_url",
+    )
+    refs_by_field: Dict[str, List[Any]] = {}
+    for field in extraction.grounded_fields:
+        refs_by_field.setdefault(field.field, []).append(field)
+    for field_name in scalar_fields:
+        value = getattr(extraction, field_name)
+        if value is None:
+            continue
+        refs = refs_by_field.get(field_name, [])
+        if not refs:
+            errors.append(f"non-null field {field_name!r} has no citation")
+            continue
+        if field_name in {
+            "offer_kind",
+            "quota_mode",
+            "renewal_period",
+            "access_method",
+        } and refs[0].value != value:
+            errors.append(f"enum field {field_name!r} citation value does not match extraction")
+
+    if extraction.models:
+        refs = refs_by_field.get("models", [])
+        if len(refs) != len(extraction.models):
+            errors.append("non-null field 'models' does not have one citation per model")
+    return errors
+
+
 class ConfirmationError(Exception):
     """Raised when a provider fails a confirmation hard gate."""
 
@@ -124,6 +175,11 @@ def confirm_provider(
         raise ConfirmationError(
             f"confirmation requires grounded extraction: {inp.extraction.failure_reason or 'failed'}"
         )
+    grounding_errors = _extraction_grounding_errors(inp.extraction, evidence)
+    if grounding_errors:
+        raise ConfirmationError(
+            "confirmation requires grounded extraction: " + "; ".join(grounding_errors)
+        )
 
     # Gate 2b: the offer must be a programmatic API offer, not a consumer chat UI.
     if not _has_programmatic_api_scope(evidence, inp.extraction):
@@ -144,6 +200,8 @@ def confirm_provider(
 
     # Normalize offer fields (code decides offer_status from as_of)
     offer = _normalize_offer(inp.extraction, as_of)
+    if offer.offer_kind is OfferKind.unknown:
+        raise ConfirmationError("normalized offer_kind is unknown; cannot confirm")
     if offer.offer_status is not OfferStatus.active:
         raise ConfirmationError("offer_status is not active as of as_of; cannot confirm")
 
