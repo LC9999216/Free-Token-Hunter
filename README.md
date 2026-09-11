@@ -1,0 +1,118 @@
+# Free Token Hunter
+
+Free Token Hunter discovers legitimate free AI/LLM API offers, verifies them against current
+first-party evidence, extracts normalized facts, calculates deterministic trust/value scores, and
+writes a local provider registry.
+
+## Milestone-one flow
+
+```text
+Internet / GitHub / curated sources
+        ↓
+Candidate + source observations
+        ↓
+Official evidence resolution and validation
+        ↓
+Grounded structured extraction
+        ↓
+Verification Confidence
+        ↓
+Free Score
+        ↓
+Provider Registry
+```
+
+## What "confirmed" means in stage one
+
+Stage-one confirmation means **currently documented by sufficient first-party evidence as a free
+programmatic API offer**. It does **not** prove that a real credential or request has worked. No
+registration, credential creation, or runtime API probing happens here.
+
+Community sources (GitHub, Hacker News, curated lists, web search, imported registries) create or
+enrich a **Candidate** only. Only first-party evidence validated against configured trust anchors
+can lead to `FREE_CONFIRMED`. Imported `verified`/`last_verified` values are treated as third-party
+assertions, preserved as observation metadata, and never copied into project state.
+
+## Scoring
+
+- **Verification Confidence V1** measures how strongly current, grounded, first-party evidence
+  supports a free programmatic API offer.
+- **Free Score V1** measures how attractive the free offer is.
+Both are deterministic, use fixed weights from `config/scoring.yaml`, and require an explicit
+timezone-aware `as_of` timestamp. They never read the system clock.
+
+## Explicit non-goals (stage one)
+
+- No Feishu synchronization or notifications.
+- No provider account registration.
+- No API-key creation or storage (credentials appear only as named variables in `.env.example`).
+- No runtime API probing.
+- No FreeLLMPool integration.
+- No load balancing or provider routing.
+- No dashboards.
+- No multi-account quota rotation.
+- No PostgreSQL, Redis, queues, or distributed workers.
+
+## Repository layout
+
+```text
+src/hunter/
+  collectors/     discovery adapters and the pinned seed importer
+  discovery/      observations, candidate store, deduplicator, orchestrator
+  evidence/       models, store, resolver, safe fetcher, validator, extractor
+  registry/       schema, store, history, state machine, confirmation
+  scoring/        Verification Confidence V1 and Free Score V1
+  llm/            tool-less grounded extraction boundary
+  config.py       configuration loading
+  cli.py          command-line interface
+data/             providers.json, candidates.json, evidence.json, history.jsonl
+config/           settings.yaml, sources.yaml, scoring.yaml
+tests/            fully offline deterministic suite
+```
+
+## Commands
+
+```text
+hunter version
+hunter import-seed --input PATH
+hunter discover --source github
+hunter collect-evidence --candidate-id ID
+hunter run-stage-one --as-of ISO_TIMESTAMP   # alias: hunter pipeline
+```
+
+`run-stage-one` is fully offline against the frozen fixture and prints the stage-one summary:
+
+```text
+candidates_processed, providers_created, providers_updated, free_confirmed,
+uncertain, not_free, expired, rejected, unchanged, errors
+```
+
+## Confirmation hard gates
+
+`confirm_provider()` is the only path into `FREE_CONFIRMED`; the generic transition API rejects it.
+All of these must hold:
+
+1. a stable Provider identity;
+2. at least one `OFFICIAL` item supporting a current free **programmatic API** offer
+   (a free consumer chat UI does not qualify);
+3. grounded structured extraction (quote + offsets matching the evidence text exactly);
+4. normalized offer fields, with `offer_status` decided by code from `as_of`;
+5. no unresolved higher-priority contradiction;
+6. `offer_status=active`;
+7. a known expiry for promotions;
+8. Verification Confidence at or above 80.
+
+Any failure returns a typed error and mutates nothing.
+
+## Running the tests
+
+```bash
+python -m pip install -e .
+python -m pytest          # fully offline: network, GitHub, search, and LLM are all fakes
+```
+
+Default tests never hit the network and never mock business rules — only the network/LLM boundary is
+faked. The pinned upstream fixture (`tests/fixtures/upstream/free-llm-api-hub-v2.9.0.json`) is frozen
+in the repo so every run is reproducible.
+
+See `CODEX_TASKS_000_010.md` for the authoritative task breakdown.

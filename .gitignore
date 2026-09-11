@@ -1,0 +1,31 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local tooling and test scratch
+.pytest-work/
+.pipwork/
+.pytest-tmp/
+.pytest-tmp*/
+pytest-cache-files-*/
+
+# Transient registry transaction journal (crash recovery)
+data/.registry_txn.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
