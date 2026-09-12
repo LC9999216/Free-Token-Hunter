@@ -8,6 +8,16 @@ Mirrors the Registry's journaled pattern (AGENTS.md §12):
 
 Recovery same logic: new revision present → append missing event;
 old revision still present → discard; anything else → fail closed.
+
+Review round 2 hardening:
+- strict top-level structure validation ({"items": [...]});
+- duplicate provider IDs fail closed;
+- corrupt history lines fail closed (never silently skipped);
+- each record's last_event_id is re-verified against its revision+content
+  so a tampered snapshot cannot load;
+- approval_binding can be cleared by passing None;
+- a single-instance process lock guards the store;
+- writes fsync before atomic replace.
 """
 
 from __future__ import annotations
@@ -21,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .locks import ProcessFileLock
 from .models import (
     ActualPoolStatus,
     ApprovalBinding,
@@ -102,17 +113,37 @@ def _deserialize_rp(raw: Dict[str, Any]) -> RuntimeProvider:
     return RuntimeProvider(**raw)
 
 
+def _expected_event_id(rp: RuntimeProvider) -> str:
+    """Re-derive the event_id bound to this snapshot content + revision."""
+    raw = _serialize(rp)
+    raw["last_event_id"] = ""
+    digest = _change_digest(raw)
+    return make_runtime_event_id(rp.provider_id, rp.revision, digest)
+
+
 class RuntimeStore:
     """Journaled runtime store at data/runtime_providers.json."""
 
     JOURNAL_NAME = ".runtime_txn.json"
+    LOCK_NAME = ".runtime.lock"
 
-    def __init__(self, providers_path: Path, history_path: Path):
+    def __init__(self, providers_path: Path, history_path: Path, lock: bool = True):
         self.providers_path = providers_path
         self._history_path = history_path
         self._providers: Dict[str, RuntimeProvider] = {}
-        self._load()
-        self.recover_pending_transaction()
+        self._lock = ProcessFileLock(providers_path.parent / self.LOCK_NAME) if lock else None
+        if self._lock is not None:
+            self._lock.acquire()
+        try:
+            self._load()
+            # History corruption must fail closed at open time (review 六.2),
+            # not silently surface later.
+            self._history_event_ids()
+            self.recover_pending_transaction()
+        except BaseException:
+            if self._lock is not None:
+                self._lock.release()
+            raise
 
     # --- persistence ---------------------------------------------------------
 
@@ -121,14 +152,53 @@ class RuntimeStore:
             return
         try:
             payload = json.loads(self.providers_path.read_text(encoding="utf-8"))
-            items = payload.get("items", []) if isinstance(payload, dict) else []
-            for raw in items:
-                rp = _deserialize_rp(raw)
-                self._providers[rp.provider_id] = rp
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError(
                 f"cannot load runtime store {self.providers_path}: {exc}"
             ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"runtime store {self.providers_path}: top-level must be an object"
+            )
+        if set(payload.keys()) != {"items"}:
+            raise RuntimeError(
+                f"runtime store {self.providers_path}: top-level must contain exactly 'items'"
+            )
+        items = payload["items"]
+        if not isinstance(items, list):
+            raise RuntimeError(
+                f"runtime store {self.providers_path}: 'items' must be a list"
+            )
+        for raw in items:
+            if not isinstance(raw, dict):
+                raise RuntimeError(
+                    f"runtime store {self.providers_path}: item is not an object"
+                )
+            try:
+                rp = _deserialize_rp(raw)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise RuntimeError(
+                    f"runtime store {self.providers_path}: invalid record: {exc}"
+                ) from exc
+            if rp.provider_id in self._providers:
+                raise RuntimeError(
+                    f"runtime store {self.providers_path}: duplicate provider id "
+                    f"{rp.provider_id!r}"
+                )
+            # event/snapshot binding: the stored event_id must match the
+            # deterministic derivation over this content at this revision.
+            if rp.revision > 0 and rp.last_event_id:
+                if rp.last_event_id != _expected_event_id(rp):
+                    raise RuntimeError(
+                        f"runtime store {self.providers_path}: event/snapshot binding "
+                        f"mismatch for {rp.provider_id!r} (revision {rp.revision})"
+                    )
+            elif rp.revision > 0 and not rp.last_event_id:
+                raise RuntimeError(
+                    f"runtime store {self.providers_path}: record {rp.provider_id!r} "
+                    f"has revision {rp.revision} but no event id"
+                )
+            self._providers[rp.provider_id] = rp
 
     def _serialize(self) -> bytes:
         raw_items = [_serialize(rp) for rp in self._providers.values()]
@@ -144,6 +214,8 @@ class RuntimeStore:
         try:
             with os.fdopen(fd, "wb") as fh:
                 fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp_name, self.providers_path)
         except OSError:
             try:
@@ -202,7 +274,9 @@ class RuntimeStore:
                 expected_pool_status=provider.expected_pool_status,
                 actual_pool_status=provider.actual_pool_status,
                 approval_status=provider.approval_status,
-                approval_binding=provider.approval_binding or existing.approval_binding,
+                # Review 六.3: approval_binding must be clearable by passing
+                # None — take the incoming value verbatim.
+                approval_binding=provider.approval_binding,
                 revision=new_rev,
                 last_event_id="",
                 last_synced_at=provider.last_synced_at or existing.last_synced_at,
@@ -289,10 +363,21 @@ class RuntimeStore:
             "event": event,
         }
         journal.parent.mkdir(parents=True, exist_ok=True)
-        journal.write_text(
-            json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str),
-            encoding="utf-8",
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(journal.parent), prefix=".runtime-journal-", suffix=".tmp"
         )
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8"))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, journal)
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def _remove_journal(journal: Path) -> None:
@@ -311,18 +396,33 @@ class RuntimeStore:
         line = json.dumps(event, sort_keys=True, ensure_ascii=False, default=str)
         with self.history_path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         return True
 
     def _history_event_ids(self) -> set:
+        """Read history event ids; CORRUPT LINES FAIL CLOSED (review 六.2)."""
         if not self.history_path.is_file():
             return set()
         ids = set()
-        for line in self.history_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                try:
-                    ids.add(json.loads(line).get("event_id"))
-                except json.JSONDecodeError:
-                    continue
+        for line_no, line in enumerate(
+            self.history_path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"corrupt runtime history {self.history_path} at line {line_no}; "
+                    "manual inspection required"
+                ) from exc
+            if not isinstance(event, dict) or not event.get("event_id"):
+                raise RuntimeError(
+                    f"corrupt runtime history {self.history_path} at line {line_no}; "
+                    "manual inspection required"
+                )
+            ids.add(event["event_id"])
         return ids
 
     def recover_pending_transaction(self) -> None:
@@ -369,3 +469,8 @@ class RuntimeStore:
     @history_path.setter
     def history_path(self, value: Path) -> None:
         self._history_path = value
+
+    def close(self) -> None:
+        """Release the single-instance lock (idempotent)."""
+        if self._lock is not None:
+            self._lock.release()

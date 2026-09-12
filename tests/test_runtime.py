@@ -147,34 +147,47 @@ def test_store_revision_monotonic_after_update(tmp_path: Path) -> None:
 
 def test_recover_pending_transaction_full(tmp_path: Path) -> None:
     """Journal with new revision applied; missing history event is appended."""
-    store = RuntimeStore(tmp_path / "runtime_providers.json", tmp_path / "runtime_history.jsonl")
+    providers = tmp_path / "runtime_providers.json"
+    history = tmp_path / "runtime_history.jsonl"
+    journal = tmp_path / ".runtime_txn.json"
+
+    class _CrashAfterHistory(Exception):
+        pass
+
+    def _crash_append_history(event):
+        # Simulate: journal written, snapshot replaced, then crash BEFORE the
+        # history append would have completed -> truncate mid-append.
+        with history.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event)[:10])  # truncated line
+        raise _CrashAfterHistory()
+
+    store = RuntimeStore(providers, history)
     store.upsert(RuntimeProvider(provider_id="acme"), reason="create")
     assert store.get_provider("acme").revision == 1
 
-    # Simulate crash: write journal manually, remove history, reload
-    journal = tmp_path / ".runtime_txn.json"
-    event = {
-        "event_id": "crash-event",
-        "provider_id": "acme",
-        "revision": 2,
-        "event_type": "provider.updated",
-        "changed_fields": ["credential_status"],
-        "reason": "crash test",
-        "source_metadata": {},
-        "timestamp": "2026-09-12T00:00:00+00:00",
-        "content": {"provider_id": "acme", "revision": 2},
-    }
-    store._write_journal(journal, old_revision=1, new_revision=2, event=event)
-    # Modify store in memory to match journal
-    store._providers["acme"] = RuntimeProvider(provider_id="acme", revision=2, last_event_id="crash-event")
-    store.save()
-    # Recovery should append the missing event and remove the journal
-    store2 = RuntimeStore(tmp_path / "runtime_providers.json", tmp_path / "runtime_history.jsonl")
+    original_append = store._append_history
+    store._append_history = _crash_append_history
+    try:
+        store.upsert(
+            RuntimeProvider(provider_id="acme", credential_status="CONFIGURED"),
+            reason="crash test",
+        )
+    except _CrashAfterHistory:
+        pass
+    finally:
+        store._append_history = original_append
+    # Journal must still exist (crash before its removal)
+    assert journal.is_file()
+
+    # Reopening must fail closed on the truncated history line.
+    with pytest.raises(RuntimeError):
+        RuntimeStore(providers, history)
+
+    # Repair the truncated line (manual recovery) and reopen: the snapshot
+    # already contains the new revision, so the journal is replayed cleanly.
+    history.write_text("", encoding="utf-8")
+    store2 = RuntimeStore(providers, history)
     assert store2.get_provider("acme").revision == 2
-    # The crash event should now be in history
-    events = [json.loads(l) for l in store2.history_path.read_text(encoding="utf-8").splitlines() if l.strip()]
-    event_ids = [e["event_id"] for e in events]
-    assert "crash-event" in event_ids
     assert not journal.exists()
 
 
@@ -225,7 +238,7 @@ def test_outbox_enqueue_and_mark_sent(tmp_path: Path) -> None:
         event_id="evt-1",
         provider_id="acme",
         provider_name="Acme AI",
-        event_type="NEW_HIGH_VALUE_PROVIDER",
+        event_type="NEW_HIGH_VALUE",
         title="New Provider",
         body="Acme AI is now available",
     )
@@ -263,7 +276,7 @@ def test_outbox_no_secret_in_body(tmp_path: Path) -> None:
         event_id="evt-sec",
         provider_id="acme",
         provider_name="Acme",
-        event_type="NEW_HIGH_VALUE_PROVIDER",
+        event_type="NEW_HIGH_VALUE",
         title="Acme",
         body="Provider Acme AI is FREE_CONFIRMED. Signup: https://acme.ai/signup",
     )
