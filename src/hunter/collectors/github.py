@@ -4,6 +4,11 @@ Normalizes GitHub search results into provenance-preserving
 CandidateObservations. Repository content is untrusted and never executed.
 The optional token comes only from a named environment variable. Network
 access is fully injectable so tests stay offline.
+
+FIX-003 (Stage 1.5):
+- GITHUB_TOKEN is sent only to api.github.com (Authorization: Bearer).
+- Redirects to non-GitHub domains are refused; the token never leaks.
+- Token is redacted from exceptions, observations, and log output.
 """
 
 from __future__ import annotations
@@ -19,6 +24,9 @@ from ..discovery.models import CandidateObservation, SourceType
 
 GITHUB_API = "https://api.github.com/search/repositories"
 
+# Known official GitHub API domains; token must never leave these.
+OFFICIAL_GITHUB_DOMAINS = {"api.github.com", "github.com"}
+
 
 class GitHubHttpError(Exception):
     """Raised for HTTP errors (rate limits, transient failures)."""
@@ -28,20 +36,63 @@ class GitHubHttpError(Exception):
         self.status = status
 
 
+class RedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Custom redirect handler that refuses to follow redirects off
+    official GitHub API domains, preventing token leakage."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urllib.parse.urlparse(newurl)
+        host = (parsed.hostname or "").lower()
+        if host not in OFFICIAL_GITHUB_DOMAINS:
+            raise urllib.error.HTTPError(
+                newurl, code,
+                f"refusing to follow redirect to non-official domain {host!r}",
+                headers, fp
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class HttpTransport:
-    """Minimal injectable HTTP JSON GET (default uses urllib, no auth headers)."""
+    """Minimal injectable HTTP JSON GET (default uses urllib, no auth headers).
+
+    FIX-003: token is sent only to api.github.com via Authorization header,
+    and errors are sanitized so the token never appears in exception text.
+    """
+
+    def __init__(self, token: Optional[str] = None):
+        self._token = token
+
+    def _sanitize(self, msg: str) -> str:
+        """Redact token-like patterns from messages."""
+        if self._token:
+            msg = msg.replace(self._token, "***REDACTED***")
+        # Also redact common bearer patterns
+        import re as _re
+        msg = _re.sub(r'(Bearer|bearer|api[_-]?key|token)[\s=:]+[A-Za-z0-9_\-\.]+', r'\1 ***REDACTED***', msg)
+        return msg
 
     def get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         if params:
             url = url + "?" + urllib.parse.urlencode(params)
-        request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+
+        # Only send token to official GitHub API domain
+        headers = {"Accept": "application/vnd.github+json"}
+        if self._token and host == "api.github.com":
+            headers["Authorization"] = f"Bearer {self._token}"
+
+        opener = urllib.request.build_opener(RedirectHandler)
+        request = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with opener.open(request, timeout=30) as response:
                 body = response.read()
         except urllib.error.HTTPError as exc:
-            raise GitHubHttpError(f"github http {exc.code}: {exc.reason}", exc.code) from exc
+            msg = self._sanitize(f"github http {exc.code}: {exc.reason}")
+            raise GitHubHttpError(msg, exc.code) from exc
         except urllib.error.URLError as exc:
-            raise GitHubHttpError(f"github network error: {exc.reason}") from exc
+            msg = self._sanitize(f"github network error: {exc.reason}")
+            raise GitHubHttpError(msg) from exc
         try:
             return json.loads(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
@@ -59,7 +110,7 @@ class GitHubCollector:
         per_page: int = 10,
         max_total: int = 50,
     ):
-        self.http = http or HttpTransport()
+        self.http = http or HttpTransport(token=token)
         self.token = token  # token is only read from env by the factory
         self.queries = queries or ["free llm api"]
         self.per_page = per_page

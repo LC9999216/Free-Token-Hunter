@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+from datetime import datetime, timezone
 from typing import Dict, List, Union
 
 from hunter.evidence.fetcher import FetchResult, FetcherError
@@ -32,11 +34,19 @@ class FakeFetcher:
         body = self.bodies.get(url, self.default_body)
         if isinstance(body, str):
             body = body.encode("utf-8")
+        now_dt = datetime.now(timezone.utc)
         return FetchResult(
             status=200,
             headers={"content-type": "text/plain"},
             body=body,
             final_url=url,
+            original_url=url,
+            redirect_chain=[],
+            content_sha256=hashlib.sha256(body).hexdigest(),
+            retrieved_from_origin=True,
+            retrieval_method="safe_fetch",
+            retrieved_at=now_dt,
+            connected_ip="93.184.216.34",
         )
 
 

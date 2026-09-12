@@ -113,16 +113,15 @@ class Pipeline:
                     continue
                 text = result.body.decode("utf-8", errors="replace")
                 excerpt = _plain_text_excerpt(text)[:4000]
-                final_url = result.final_url or url
-                evidence = Evidence(
-                    candidate_id=candidate.candidate_id,
+                evidence = Evidence.from_fetch(
+                    result,
                     provider_id=candidate.candidate_id,
-                    url=final_url,
-                    source_type=_guess_source_type(final_url),
-                    retrieved_at=self.as_of,
-                    title=final_url,
+                    source_type=_guess_source_type(result.final_url or url),
                     claim=excerpt[:300],
                     content_excerpt=excerpt,
+                    retrieved_at=self.as_of,
+                    candidate_id=candidate.candidate_id,
+                    title=result.final_url or url,
                 )
                 if self.evidence_store.upsert(evidence):
                     created += 1

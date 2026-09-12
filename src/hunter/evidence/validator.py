@@ -193,15 +193,30 @@ class OfficialEvidenceValidator:
     # --- officiality --------------------------------------------------------
 
     def evaluate(self, evidence: Evidence) -> ValidationDecision:
-        """Decide officiality with a deterministic rule id and note."""
-        if evidence.officiality in (Officiality.OFFICIAL, Officiality.REJECTED):
+        """Decide officiality with a deterministic rule id and note.
+
+        FIX-001: officiality is ALWAYS recomputed from trust anchors and
+        provenance. The old TA-000 shortcut (trusting a pre-existing OFFICIAL
+        or REJECTED) is removed.
+
+        Provenance gate: only evidence retrieved from the origin can be
+        OFFICIAL.  Evidence without SafeFetcher provenance or with
+        retrieved_from_origin=false can still be LIKELY_OFFICIAL or
+        THIRD_PARTY depending on trust anchor matching — it is just
+        never OFFICIAL.
+        """
+        if evidence.officiality is Officiality.REJECTED:
             return ValidationDecision(
-                officiality=evidence.officiality,
+                officiality=Officiality.REJECTED,
                 rule_id="TA-000",
-                note="officiality already decided; validator never re-decides",
+                note="REJECTED preserved; explicit human or gate decision",
             )
+
         host = _normalize_host(urlparse(evidence.url).hostname or "")
         repo = github_repo_from_url(evidence.url)
+
+        provenance = evidence.provenance
+        provenance_ok = provenance is not None and provenance.retrieved_from_origin
 
         if not self._provider_has_anchors(evidence.provider_id):
             return ValidationDecision(
@@ -220,25 +235,41 @@ class OfficialEvidenceValidator:
         anchor = self._anchor_for(evidence.provider_id, host, repo)
         if anchor is not None:
             if repo is not None and self._github_rule_applies(anchor, repo):
+                if not provenance_ok:
+                    return ValidationDecision(
+                        officiality=Officiality.LIKELY_OFFICIAL,
+                        rule_id=RULE_GITHUB_MAPPING,
+                        note=f"mapped official GitHub repository {repo!r} but no SafeFetcher provenance; cannot be OFFICIAL",
+                    )
                 return ValidationDecision(
                     officiality=Officiality.OFFICIAL,
                     rule_id=RULE_GITHUB_MAPPING,
                     note=f"mapped official GitHub repository {repo!r}",
                 )
             normalized = [_normalize_host(d) for d in anchor.domains]
-            if host and any(d == host for d in normalized):
+            host_match = host and any(d == host for d in normalized)
+            subdomain_match = (
+                host and anchor.allow_subdomains
+                and any(host.endswith("." + d) for d in normalized)
+            )
+            if host_match or subdomain_match:
+                if not provenance_ok:
+                    rule_id = RULE_EXACT_DOMAIN if host_match else RULE_ALLOWED_SUBDOMAIN
+                    return ValidationDecision(
+                        officiality=Officiality.LIKELY_OFFICIAL,
+                        rule_id=rule_id,
+                        note=f"anchor for {anchor.provider_id!r} matches domain but no SafeFetcher provenance; cannot be OFFICIAL",
+                    )
                 return ValidationDecision(
                     officiality=Officiality.OFFICIAL,
-                    rule_id=RULE_EXACT_DOMAIN,
-                    note=f"exact configured anchor domain for {anchor.provider_id!r}",
+                    rule_id=RULE_EXACT_DOMAIN if host_match else RULE_ALLOWED_SUBDOMAIN,
+                    note=f"matched configured anchor for {anchor.provider_id!r}",
                 )
-            if host and anchor.allow_subdomains and any(
-                host.endswith("." + d) for d in normalized
-            ):
+            if not provenance_ok:
                 return ValidationDecision(
-                    officiality=Officiality.OFFICIAL,
-                    rule_id=RULE_ALLOWED_SUBDOMAIN,
-                    note=f"anchor for {anchor.provider_id!r} allows this subdomain",
+                    officiality=Officiality.LIKELY_OFFICIAL,
+                    rule_id=RULE_NO_MATCH_THIRD_PARTY,
+                    note="anchor found for provider but domain does not match; cannot be OFFICIAL",
                 )
             return ValidationDecision(
                 officiality=Officiality.OFFICIAL,

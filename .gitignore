@@ -23,6 +23,10 @@ pytest-cache-files-*/
 
 # Transient registry transaction journal (crash recovery)
 data/.registry_txn.json
+data/.runtime_txn.json
+
+# Vendor inspection artifacts
+.vendor-inspect/
 
 # IDE / OS
 .idea/

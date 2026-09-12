@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from hunter.evidence.models import Evidence, Officiality
+from datetime import datetime, timezone
+
+from hunter.evidence.models import Evidence, EvidenceProvenance, Officiality
 from hunter.evidence.validator import (
     RULE_ALLOWED_SUBDOMAIN,
     RULE_EXACT_DOMAIN,
@@ -61,12 +63,26 @@ def _validator(anchors=None) -> OfficialEvidenceValidator:
 
 
 def _evidence(url: str, source_type: str = "pricing", provider_id: str = "acme", **kw) -> Evidence:
+    # For OFFICIAL tests, auto-attach provenance
+    officiality = kw.pop("officiality", Officiality.UNCONFIRMED)
+    provenance = kw.pop("provenance", None)
+    if provenance is None and officiality is Officiality.OFFICIAL:
+        provenance = EvidenceProvenance(
+            retrieval_method="safe_fetch",
+            original_url=url,
+            final_url=url,
+            http_status=200,
+            content_sha256="abc",
+            retrieved_from_origin=True,
+            retrieved_at=datetime.fromisoformat(str(kw.get("retrieved_at", "2026-08-01T00:00:00+00:00"))),
+        )
     return Evidence(
         evidence_id=kw.pop("evidence_id", "ev-1"),
         provider_id=provider_id,
         url=url,
         source_type=source_type,
-        officiality=kw.pop("officiality", Officiality.UNCONFIRMED),
+        officiality=officiality,
+        provenance=provenance,
         claim=kw.pop("claim", "free plan"),
         content_excerpt=kw.pop("content_excerpt", "free plan"),
         retrieved_at=kw.pop("retrieved_at", "2026-08-01T00:00:00+00:00"),
@@ -178,14 +194,14 @@ def test_github_repo_from_url() -> None:
 
 def test_anchored_exact_domain_is_official() -> None:
     v = _validator()
-    decision = v.evaluate(_evidence("https://acme.ai/pricing"))
+    decision = v.evaluate(_evidence("https://acme.ai/pricing", officiality=Officiality.OFFICIAL))
     assert decision.officiality is Officiality.OFFICIAL
     assert decision.rule_id == RULE_EXACT_DOMAIN
 
 
 def test_anchored_subdomain_is_official_when_allowed() -> None:
     v = _validator()
-    decision = v.evaluate(_evidence("https://docs.beta.dev/pricing", provider_id="beta"))
+    decision = v.evaluate(_evidence("https://docs.beta.dev/pricing", provider_id="beta", officiality=Officiality.OFFICIAL))
     assert decision.officiality is Officiality.OFFICIAL
     assert decision.rule_id == RULE_ALLOWED_SUBDOMAIN
 
@@ -200,7 +216,7 @@ def test_prohibited_subdomain_is_likely_official() -> None:
 def test_mapped_github_is_official() -> None:
     v = _validator()
     decision = v.evaluate(
-        _evidence("https://github.com/beta/llm", source_type="github", provider_id="beta")
+        _evidence("https://github.com/beta/llm", source_type="github", provider_id="beta", officiality=Officiality.OFFICIAL)
     )
     assert decision.officiality is Officiality.OFFICIAL
     assert decision.rule_id == RULE_GITHUB_MAPPING
@@ -253,7 +269,16 @@ def test_search_result_url_never_official() -> None:
 
 def test_validate_appends_rule_note() -> None:
     v = _validator()
-    validated = v.validate(_evidence("https://acme.ai/pricing"))
+    provenance = EvidenceProvenance(
+        retrieval_method="safe_fetch",
+        original_url="https://acme.ai/pricing",
+        final_url="https://acme.ai/pricing",
+        http_status=200,
+        content_sha256="abc",
+        retrieved_from_origin=True,
+        retrieved_at=datetime.fromisoformat("2026-09-01T00:00:00+00:00"),
+    )
+    validated = v.validate(_evidence("https://acme.ai/pricing", provenance=provenance, officiality=Officiality.UNCONFIRMED))
     assert validated.officiality is Officiality.OFFICIAL
     assert any(RULE_EXACT_DOMAIN in n for n in validated.validation_notes)
 
@@ -281,10 +306,21 @@ def test_third_party_assertion_cannot_create_anchor() -> None:
 
 
 def _official(evidence_id, source_type, effective=None, published=None, claim="free plan") -> Evidence:
+    retrieved = "2026-09-01T00:00:00+00:00"
+    provenance = EvidenceProvenance(
+        retrieval_method="safe_fetch",
+        original_url=f"https://acme.ai/{evidence_id}",
+        final_url=f"https://acme.ai/{evidence_id}",
+        http_status=200,
+        content_sha256="abc",
+        retrieved_from_origin=True,
+        retrieved_at=datetime.fromisoformat(retrieved),
+    )
     return _evidence(
         f"https://acme.ai/{evidence_id}",
         source_type=source_type,
         officiality=Officiality.OFFICIAL,
+        provenance=provenance,
         evidence_id=evidence_id,
         effective_at=effective,
         published_at=published,

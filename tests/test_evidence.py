@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -245,6 +246,7 @@ def test_refetch_does_not_downgrade_likely_official(tmp_path: Path) -> None:
 def test_revalidation_does_not_duplicate_notes() -> None:
     """Repeated validation must not grow validation_notes (rerun stability)."""
     from hunter.evidence.validator import OfficialEvidenceValidator, TrustAnchor
+    from hunter.evidence.models import EvidenceProvenance
 
     validator = OfficialEvidenceValidator(
         [
@@ -256,6 +258,15 @@ def test_revalidation_does_not_duplicate_notes() -> None:
             )
         ]
     )
+    provenance = EvidenceProvenance(
+        retrieval_method="safe_fetch",
+        original_url="https://acme.ai/pricing",
+        final_url="https://acme.ai/pricing",
+        http_status=200,
+        content_sha256="abc",
+        retrieved_from_origin=True,
+        retrieved_at=datetime.fromisoformat("2026-08-01T00:00:00+00:00"),
+    )
     evidence = Evidence(
         evidence_id="ev-1",
         provider_id="acme",
@@ -264,6 +275,7 @@ def test_revalidation_does_not_duplicate_notes() -> None:
         claim="free plan",
         content_excerpt="free plan programmatic API",
         retrieved_at="2026-08-01T00:00:00+00:00",
+        provenance=provenance,
     )
     once = validator.validate(evidence)
     twice = validator.validate(once)

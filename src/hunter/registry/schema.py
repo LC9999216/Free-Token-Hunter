@@ -107,6 +107,36 @@ class ProviderRequirements(BaseModel):
     regional_restrictions: Optional[str] = None
 
 
+class GroundedUrl(BaseModel):
+    """A URL grounded in evidence (FIX-004).
+
+    Every non-null ProviderSetup URL must carry an evidence citation:
+    which evidence record, the exact quote, and its offsets.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str
+    evidence_id: str
+    quote: str
+    start_offset: int = 0
+    end_offset: int = 0
+
+
+class ProviderSetup(BaseModel):
+    """Provider setup URLs grounded in evidence (FIX-004).
+
+    All fields are optional; a URL is stored only if grounded evidence exists.
+    Missing fields default to None. No third-party registry values are copied.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signup_url: Optional[GroundedUrl] = None
+    api_key_url: Optional[GroundedUrl] = None
+    setup_instructions_url: Optional[GroundedUrl] = None
+
+
 class ProviderApi(BaseModel):
     """Provider API surface (AGENTS.md 4.5)."""
 
@@ -162,6 +192,7 @@ class Provider(BaseModel):
     limits: ProviderLimits = Field(default_factory=ProviderLimits)
     evidence_ids: List[str] = Field(default_factory=list)
     official_docs: List[str] = Field(default_factory=list)
+    setup: Optional[ProviderSetup] = None
     first_discovered: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_verified: Optional[datetime] = None
     verification_confidence: Optional[int] = None

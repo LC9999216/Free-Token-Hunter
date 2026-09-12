@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from hunter.evidence.models import Evidence, Officiality
+from hunter.evidence.models import Evidence, EvidenceProvenance, Officiality
 from hunter.evidence.validator import OfficialEvidenceValidator, TrustAnchor
 from hunter.llm.models import ExtractionResult, GroundedField
 from hunter.registry.confirmation import (
@@ -43,12 +43,24 @@ def _anchor() -> TrustAnchor:
 
 
 def _evidence(official: Officiality = Officiality.OFFICIAL, source: str = "pricing") -> Evidence:
+    provenance = None
+    if official is Officiality.OFFICIAL:
+        provenance = EvidenceProvenance(
+            retrieval_method="safe_fetch",
+            original_url="https://acme.ai/pricing",
+            final_url="https://acme.ai/pricing",
+            http_status=200,
+            content_sha256="abc",
+            retrieved_from_origin=True,
+            retrieved_at=datetime.fromisoformat("2026-08-01T00:00:00+00:00"),
+        )
     return Evidence(
         evidence_id="ev-acme-pricing",
         provider_id="acme",
         url="https://acme.ai/pricing",
         source_type=source,
         officiality=official,
+        provenance=provenance,
         retrieved_at=datetime.fromisoformat("2026-08-01T00:00:00+00:00"),
         effective_at=datetime.fromisoformat("2026-08-01T00:00:00+00:00"),
         claim="free plan programmatic API",

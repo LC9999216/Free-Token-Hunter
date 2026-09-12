@@ -2,6 +2,9 @@
 
 New evidence starts ``UNCONFIRMED``. The resolver/fetcher never mark evidence
 ``OFFICIAL``. Identity derives from canonical URL plus content fingerprint.
+
+Provenance (FIX-001): created only by SafeFetcher; imported/constructed
+evidence carries no provenance and cannot become OFFICIAL without it.
 """
 
 from __future__ import annotations
@@ -32,6 +35,25 @@ class Officiality(str, enum.Enum):
     REJECTED = "REJECTED"
 
 
+class EvidenceProvenance(BaseModel):
+    """Provenance metadata created only by SafeFetcher (FIX-001).
+
+    Only evidence with ``retrieved_from_origin=true`` provenance is eligible
+    for OFFICIAL. Imported/constructed evidence must NOT carry provenance.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    retrieval_method: str = "safe_fetch"
+    original_url: str
+    final_url: str
+    redirect_chain: List[str] = Field(default_factory=list)
+    http_status: int = 200
+    content_sha256: str = ""
+    retrieved_from_origin: bool = True
+    retrieved_at: datetime
+
+
 class Evidence(BaseModel):
     """One piece of resolved evidence (AGENTS.md 8.1)."""
 
@@ -53,6 +75,7 @@ class Evidence(BaseModel):
     validation_notes: List[str] = Field(default_factory=list)
     content_fingerprint: str = ""
     content_excerpt: Optional[str] = None
+    provenance: Optional[EvidenceProvenance] = None
 
     @field_validator("evidence_id")
     @classmethod
@@ -94,6 +117,50 @@ class Evidence(BaseModel):
                 "normalized_domain": domain,
                 "content_fingerprint": fingerprint,
             }
+        )
+
+    @classmethod
+    def from_fetch(
+        cls,
+        fetch_result: Any,
+        *,
+        provider_id: Optional[str] = None,
+        source_type: str = "page",
+        claim: Optional[str] = None,
+        content_excerpt: Optional[str] = None,
+        retrieved_at: Optional[datetime] = None,
+        candidate_id: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> "Evidence":
+        """Build evidence from a SafeFetcher FetchResult, populating provenance.
+
+        Only this factory creates Evidence with provenance. Callers must not
+        manually set ``provenance``; the validator checks ``retrieved_from_origin``
+        before granting OFFICIAL.
+        """
+        sha256 = hashlib.sha256(fetch_result.body).hexdigest()
+        provenance = EvidenceProvenance(
+            retrieval_method="safe_fetch",
+            original_url=fetch_result.original_url,
+            final_url=fetch_result.final_url,
+            redirect_chain=list(fetch_result.redirect_chain),
+            http_status=fetch_result.status,
+            content_sha256=sha256,
+            retrieved_from_origin=True,
+            retrieved_at=retrieved_at or fetch_result.retrieved_at or datetime.now(timezone.utc),
+        )
+        return cls(
+            evidence_id="",
+            candidate_id=candidate_id or provider_id,
+            provider_id=provider_id or candidate_id,
+            url=fetch_result.final_url or fetch_result.original_url,
+            source_type=source_type,
+            officiality=Officiality.UNCONFIRMED,
+            retrieved_at=provenance.retrieved_at,
+            title=title or fetch_result.final_url or fetch_result.original_url,
+            claim=claim or "",
+            content_excerpt=content_excerpt or "",
+            provenance=provenance,
         )
 
 
