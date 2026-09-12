@@ -24,8 +24,33 @@ from ..discovery.models import CandidateObservation, SourceType
 
 GITHUB_API = "https://api.github.com/search/repositories"
 
-# Known official GitHub API domains; token must never leave these.
-OFFICIAL_GITHUB_DOMAINS = {"api.github.com", "github.com"}
+# The token may ONLY ever be sent to this exact origin (scheme+host+port).
+TOKEN_ORIGIN = ("https", "api.github.com", 443)
+
+
+def _origin_of(url: str):
+    """Return (scheme, host, port) for a URL, defaulting port per scheme."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    scheme = (parsed.scheme or "").lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return scheme, host, port
+
+
+def auth_headers_for(url: str, token: Optional[str]) -> Dict[str, str]:
+    """Build request headers, attaching the token ONLY to https://api.github.com:443.
+
+    FIX (review round 2): the previous code matched on host alone, so an
+    ``http://api.github.com`` URL would have received the bearer token in
+    cleartext. Scheme and port are now part of the gate.
+    """
+    headers = {"Accept": "application/vnd.github+json"}
+    if not token:
+        return headers
+    scheme, host, port = _origin_of(url)
+    if (scheme, host, port) == TOKEN_ORIGIN:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 class GitHubHttpError(Exception):
@@ -37,19 +62,48 @@ class GitHubHttpError(Exception):
 
 
 class RedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Custom redirect handler that refuses to follow redirects off
-    official GitHub API domains, preventing token leakage."""
+    """Redirect policy that keeps the Authorization token inside its origin.
+
+    Rules (review round 2):
+    - Non-HTTPS redirect targets are always refused (no HTTP downgrade).
+    - Redirects to any host other than api.github.com / github.com abort
+      (plan §4.4: non-official redirect targets are not followed).
+    - The Authorization header is forwarded only when the redirect target is
+      exactly https://api.github.com:443; every other target — including
+      github.com — has it stripped before following.
+    - Non-standard ports are refused outright.
+    """
+
+    REDIRECTABLE_HOSTS = ("api.github.com", "github.com")
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        parsed = urllib.parse.urlparse(newurl)
-        host = (parsed.hostname or "").lower()
-        if host not in OFFICIAL_GITHUB_DOMAINS:
+        scheme, host, port = _origin_of(newurl)
+        if scheme != "https":
             raise urllib.error.HTTPError(
                 newurl, code,
-                f"refusing to follow redirect to non-official domain {host!r}",
-                headers, fp
+                f"refusing non-https redirect to {host!r}",
+                headers, fp,
             )
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        if host not in self.REDIRECTABLE_HOSTS:
+            raise urllib.error.HTTPError(
+                newurl, code,
+                f"refusing redirect to non-official domain {host!r}",
+                headers, fp,
+            )
+        if port != 443:
+            raise urllib.error.HTTPError(
+                newurl, code,
+                f"refusing redirect to non-standard port {port}",
+                headers, fp,
+            )
+        new_request = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_request is None:
+            return None
+        if (scheme, host, port) != TOKEN_ORIGIN:
+            # Never forward the token to github.com or anywhere else.
+            new_request.headers.pop("Authorization", None)
+            new_request.unredirected_hdrs.pop("Authorization", None)
+        return new_request
 
 
 class HttpTransport:
@@ -74,13 +128,8 @@ class HttpTransport:
     def get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         if params:
             url = url + "?" + urllib.parse.urlencode(params)
-        parsed = urllib.parse.urlparse(url)
-        host = (parsed.hostname or "").lower()
-
-        # Only send token to official GitHub API domain
-        headers = {"Accept": "application/vnd.github+json"}
-        if self._token and host == "api.github.com":
-            headers["Authorization"] = f"Bearer {self._token}"
+        # Token is attached only to https://api.github.com:443.
+        headers = auth_headers_for(url, self._token)
 
         opener = urllib.request.build_opener(RedirectHandler)
         request = urllib.request.Request(url, headers=headers)

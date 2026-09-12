@@ -225,58 +225,29 @@ def _env_or_none(name: str):
 
 
 def _handle_collect_evidence(args: argparse.Namespace) -> int:
-    from .config import load_settings, load_sources
+    from .config import load_settings
     from .discovery.store import CandidateStore
+    from .evidence.collect import collect_evidence
     from .evidence.fetcher import SafeFetcher
-    from .evidence.resolver import EvidenceResolver
     from .evidence.store import EvidenceStore
 
     settings = load_settings()
-    sources = load_sources()
     if args.data_dir:
         data_dir = Path(args.data_dir)
     else:
         data_dir = Path(settings["paths"]["data_dir"])
     candidate_store = CandidateStore(data_dir / "candidates.json")
     evidence_store = EvidenceStore(data_dir / "evidence.json")
-    resolver = EvidenceResolver()
     fetcher = SafeFetcher(max_pages_per_provider=args.max_pages_per_provider)
-
-    candidates = candidate_store.list_candidates()
-    if args.candidate_id:
-        candidates = [c for c in candidates if c.candidate_id == args.candidate_id]
-    fetched = 0
-    for candidate in candidates:
-        observations = [o.model_dump(mode="json") for o in candidate.observations]
-        urls = resolver.propose_urls(
-            candidate_domain=candidate.canonical_domain_hint,
-            observations=observations,
-        )
-        for url in urls:
-            if fetched >= args.limit:
-                break
-            try:
-                result = fetcher.fetch(url, provider_id=candidate.candidate_id)
-            except Exception as exc:  # noqa: BLE001 - fetch failures are per-URL
-                print(f"{candidate.candidate_id}: {url} -> ERROR {exc}")
-                continue
-            text = result.body.decode("utf-8", errors="replace")[:2000]
-            excerpt = _plain_text_excerpt(text)
-            from .evidence.models import Evidence
-
-            evidence_store.upsert(
-                Evidence(
-                    candidate_id=candidate.candidate_id,
-                    url=url,
-                    source_type=_guess_source_type(url),
-                    title=url,
-                    claim=excerpt[:300],
-                    content_excerpt=excerpt,
-                )
-            )
-            fetched += 1
-            print(f"{candidate.candidate_id}: {url} -> {result.status}")
-    print(f"fetched={fetched}")
+    report = collect_evidence(
+        candidate_store,
+        evidence_store,
+        fetcher,
+        candidate_id=args.candidate_id,
+        limit=args.limit,
+    )
+    for line in report.as_lines():
+        print(line)
     return 0
 
 

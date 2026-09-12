@@ -55,10 +55,10 @@ def test_safe_fetcher_populates_provenance() -> None:
     class DummyTransport:
         def resolve(self, host):
             return ["93.184.216.34"]
-        def request(self, url):
+        def request(self, url, pinned_ip=None):
             return (200, {"Content-Type": "text/html"}, b"free tier programmatic API")
 
-    fetcher = SafeFetcher(transport=DummyTransport())
+    fetcher = SafeFetcher(test_transport=DummyTransport())
     result = fetcher.fetch("https://acme.ai/pricing", provider_id="acme")
     assert result.retrieval_method == "safe_fetch"
     assert result.original_url == "https://acme.ai/pricing"
@@ -75,22 +75,23 @@ def test_evidence_from_fetch_populates_all_provenance_fields() -> None:
     class DummyTransport:
         def resolve(self, host):
             return ["93.184.216.34"]
-        def request(self, url):
+        def request(self, url, pinned_ip=None):
             return (200, {"Content-Type": "text/html"}, b"free tier")
 
-    fetcher = SafeFetcher(transport=DummyTransport())
+    fetcher = SafeFetcher(test_transport=DummyTransport())
     result = fetcher.fetch("https://acme.ai/pricing", provider_id="acme")
     ev = Evidence.from_fetch(
         result,
         provider_id="acme",
         source_type="pricing",
         claim="free tier",
-        content_excerpt="free tier",
     )
     assert ev.provenance is not None
     assert ev.provenance.retrieval_method == "safe_fetch"
     assert ev.provenance.retrieved_from_origin is True
     assert ev.provenance.content_sha256 == result.content_sha256
+    # the excerpt is derived from the actually fetched body (binding)
+    assert ev.content_excerpt == "free tier"
 
 
 def test_evidence_without_provenance_cannot_be_official_through_validator() -> None:
@@ -217,9 +218,9 @@ def test_direct_private_ip_rejected() -> None:
     class PrivateTransport:
         def resolve(self, host):
             return ["10.0.0.5"]
-        def request(self, url):
+        def request(self, url, pinned_ip=None):
             return (200, {"Content-Type": "text/html"}, b"secret")
-    fetcher = SafeFetcher(transport=PrivateTransport())
+    fetcher = SafeFetcher(test_transport=PrivateTransport())
     with pytest.raises(FetcherError):
         fetcher.fetch("http://internal.example/x", provider_id="p1")
 
@@ -229,9 +230,9 @@ def test_private_ipv6_rejected() -> None:
     class PrivateV6Transport:
         def resolve(self, host):
             return ["fc00::1"]
-        def request(self, url):
+        def request(self, url, pinned_ip=None):
             return (200, {"Content-Type": "text/html"}, b"secret")
-    fetcher = SafeFetcher(transport=PrivateV6Transport())
+    fetcher = SafeFetcher(test_transport=PrivateV6Transport())
     with pytest.raises(FetcherError):
         fetcher.fetch("http://v6-internal.example/x", provider_id="p1")
 
@@ -247,12 +248,12 @@ def test_public_to_private_ipv6_redirect_rejected() -> None:
             if host == "v6-internal.local":
                 return ["fc00::1"]
             return []
-        def request(self, url):
+        def request(self, url, pinned_ip=None):
             self.calls.append(url)
             if url == "https://public.example/start":
                 return (302, {"Location": "http://v6-internal.local/secret"}, b"")
             return (200, {"Content-Type": "text/html"}, b"ok")
-    fetcher = SafeFetcher(transport=RedirectToPrivateV6Transport())
+    fetcher = SafeFetcher(test_transport=RedirectToPrivateV6Transport())
     with pytest.raises(FetcherError):
         fetcher.fetch("https://public.example/start", provider_id="p1")
 
@@ -266,14 +267,14 @@ def test_multiple_redirects_all_public_succeeds() -> None:
             return {"a.example": ["93.184.216.34"],
                     "b.example": ["93.184.216.35"],
                     "c.example": ["93.184.216.36"]}.get(host, ["93.184.216.34"])
-        def request(self, url):
+        def request(self, url, pinned_ip=None):
             self.calls.append(url)
             if url == "https://a.example/1":
                 return (302, {"Location": "https://b.example/2"}, b"")
             if url == "https://b.example/2":
                 return (302, {"Location": "https://c.example/3"}, b"")
             return (200, {"Content-Type": "text/html"}, b"final")
-    fetcher = SafeFetcher(transport=PublicRedirectTransport(), max_redirects=3)
+    fetcher = SafeFetcher(test_transport=PublicRedirectTransport(), max_redirects=3)
     result = fetcher.fetch("https://a.example/1", provider_id="p1")
     assert result.status == 200
     assert b"final" in result.body
@@ -292,12 +293,12 @@ def test_dns_rebind_after_redirect_rejected() -> None:
             if host == "evil.local":
                 return ["192.168.1.1"]
             return ["93.184.216.34"]
-        def request(self, url):
+        def request(self, url, pinned_ip=None):
             self.calls.append(("request", url))
             if url == "https://public.example/start":
                 return (302, {"Location": "https://evil.local/secret"}, b"")
             return (200, {"Content-Type": "text/html"}, b"ok")
-    fetcher = SafeFetcher(transport=RebindTransport())
+    fetcher = SafeFetcher(test_transport=RebindTransport())
     with pytest.raises(FetcherError):
         fetcher.fetch("https://public.example/start", provider_id="p1")
 

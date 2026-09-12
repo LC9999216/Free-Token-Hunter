@@ -72,7 +72,7 @@ def _evidence(url: str, source_type: str = "pricing", provider_id: str = "acme",
             original_url=url,
             final_url=url,
             http_status=200,
-            content_sha256="abc",
+            content_sha256="a" * 64,
             retrieved_from_origin=True,
             retrieved_at=datetime.fromisoformat(str(kw.get("retrieved_at", "2026-08-01T00:00:00+00:00"))),
         )
@@ -274,7 +274,7 @@ def test_validate_appends_rule_note() -> None:
         original_url="https://acme.ai/pricing",
         final_url="https://acme.ai/pricing",
         http_status=200,
-        content_sha256="abc",
+        content_sha256="a" * 64,
         retrieved_from_origin=True,
         retrieved_at=datetime.fromisoformat("2026-09-01T00:00:00+00:00"),
     )
@@ -312,7 +312,7 @@ def _official(evidence_id, source_type, effective=None, published=None, claim="f
         original_url=f"https://acme.ai/{evidence_id}",
         final_url=f"https://acme.ai/{evidence_id}",
         http_status=200,
-        content_sha256="abc",
+        content_sha256="a" * 64,
         retrieved_from_origin=True,
         retrieved_at=datetime.fromisoformat(retrieved),
     )

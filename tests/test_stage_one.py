@@ -302,7 +302,7 @@ def _official_evidence() -> Evidence:
         original_url="https://acme.ai/pricing",
         final_url="https://acme.ai/pricing",
         http_status=200,
-        content_sha256="abc",
+        content_sha256="a" * 64,
         retrieved_from_origin=True,
         retrieved_at=AS_OF,
     )
@@ -524,7 +524,7 @@ def test_consumer_chat_only_offer_rejected(tmp_path: Path) -> None:
         original_url="https://acme.ai/pricing",
         final_url="https://acme.ai/pricing",
         http_status=200,
-        content_sha256="abc",
+        content_sha256="a" * 64,
         retrieved_from_origin=True,
         retrieved_at=AS_OF,
     )

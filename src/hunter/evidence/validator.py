@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from .models import Evidence, Officiality
+from .models import Evidence, EvidenceProvenance, Officiality, canonicalize_evidence_url
 
 # Evidence precedence, highest first (AGENTS.md 8.3).
 SOURCE_PRIORITY = ["pricing", "api-docs", "docs", "blog", "github"]
@@ -54,6 +54,67 @@ URL_SHORTENERS = {
 
 class ContradictionError(Exception):
     """Raised when evidence cannot resolve without ambiguity."""
+
+
+_SHA256_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
+
+
+def verify_provenance(evidence: Evidence) -> Optional[str]:
+    """Validate an EvidenceProvenance against the evidence it claims to describe.
+
+    Returns None when the provenance is fully consistent and self-declaring a
+    genuine SafeFetcher retrieval; otherwise returns a structured reason code
+    describing the first failed binding. Any failure must fail closed: the
+    evidence cannot be OFFICIAL.
+
+    Verified bindings (review round 2):
+    - retrieval_method is exactly "safe_fetch";
+    - http_status is a 2xx;
+    - final_url parses to an http(s) URL and binds to the evidence URL
+      (canonical equality — Evidence.from_fetch sets url = final_url);
+    - redirect_chain, when present, starts at original_url and contains only
+      parseable http(s) URLs;
+    - content_sha256 is a well-formed sha256 hex digest;
+    - retrieved_from_origin is true.
+    """
+    prov = evidence.provenance
+    if prov is None:
+        return "provenance_missing"
+    if prov.retrieval_method != "safe_fetch":
+        return "retrieval_method_not_safe_fetch"
+    if not (200 <= int(prov.http_status) < 300):
+        return "http_status_not_2xx"
+    if not prov.retrieved_from_origin:
+        return "not_retrieved_from_origin"
+    if not isinstance(prov.content_sha256, str) or not _SHA256_RE.match(prov.content_sha256):
+        return "content_sha256_malformed"
+    try:
+        final = urlparse(prov.final_url)
+    except ValueError:
+        return "final_url_unparseable"
+    if (final.scheme or "").lower() not in ("http", "https") or not final.hostname:
+        return "final_url_bad_scheme"
+    if canonicalize_evidence_url(prov.final_url) != canonicalize_evidence_url(evidence.url):
+        return "final_url_not_bound_to_evidence"
+    chain = prov.redirect_chain or []
+    if chain:
+        try:
+            first = urlparse(chain[0])
+        except ValueError:
+            return "redirect_chain_unparseable"
+        if canonicalize_evidence_url(chain[0]) != canonicalize_evidence_url(prov.original_url):
+            return "redirect_chain_not_from_original"
+        for hop in chain:
+            try:
+                parsed_hop = urlparse(hop)
+            except ValueError:
+                return "redirect_chain_unparseable"
+            if (parsed_hop.scheme or "").lower() not in ("http", "https") or not parsed_hop.hostname:
+                return "redirect_chain_bad_scheme"
+    else:
+        if canonicalize_evidence_url(prov.original_url) != canonicalize_evidence_url(prov.final_url):
+            return "original_final_mismatch_without_redirects"
+    return None
 
 
 @dataclass(frozen=True)
@@ -215,8 +276,11 @@ class OfficialEvidenceValidator:
         host = _normalize_host(urlparse(evidence.url).hostname or "")
         repo = github_repo_from_url(evidence.url)
 
-        provenance = evidence.provenance
-        provenance_ok = provenance is not None and provenance.retrieved_from_origin
+        # Strict provenance verification (review round 2): a constructed or
+        # imported provenance that fails ANY binding check can never be
+        # OFFICIAL, even when retrieved_from_origin claims true.
+        provenance_failure = verify_provenance(evidence)
+        provenance_ok = provenance_failure is None
 
         if not self._provider_has_anchors(evidence.provider_id):
             return ValidationDecision(
@@ -239,7 +303,7 @@ class OfficialEvidenceValidator:
                     return ValidationDecision(
                         officiality=Officiality.LIKELY_OFFICIAL,
                         rule_id=RULE_GITHUB_MAPPING,
-                        note=f"mapped official GitHub repository {repo!r} but no SafeFetcher provenance; cannot be OFFICIAL",
+                        note=f"mapped official GitHub repository {repo!r} but provenance gate failed ({provenance_failure}); cannot be OFFICIAL",
                     )
                 return ValidationDecision(
                     officiality=Officiality.OFFICIAL,
@@ -258,7 +322,7 @@ class OfficialEvidenceValidator:
                     return ValidationDecision(
                         officiality=Officiality.LIKELY_OFFICIAL,
                         rule_id=rule_id,
-                        note=f"anchor for {anchor.provider_id!r} matches domain but no SafeFetcher provenance; cannot be OFFICIAL",
+                        note=f"anchor for {anchor.provider_id!r} matches domain but provenance gate failed ({provenance_failure}); cannot be OFFICIAL",
                     )
                 return ValidationDecision(
                     officiality=Officiality.OFFICIAL,

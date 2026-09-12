@@ -106,23 +106,35 @@ def check_url(url: str) -> urlparse.ParseResult:
 
 
 class SafeFetcher:
-    """HTTP(S) fetcher enforcing all SSRF and size/timeout limits."""
+    """HTTP(S) fetcher enforcing all SSRF and size/timeout limits.
+
+    Production instances must be constructed WITHOUT ``test_transport``: the
+    real path resolves a verified public IP, pins the connection to it (DNS
+    rebinding protection), keeps the hostname only for Host/SNI, and
+    re-resolves on every redirect hop.
+
+    ``test_transport`` is an explicit TEST-ONLY seam (review round 2): it
+    replaces the socket layer in offline tests and MUST honor the pinned IP
+    it is handed — the resolved, validated address is passed to every
+    ``request(url, pinned_ip=...)`` call so a fake that "connects" uses the
+    same address the production path would use.
+    """
 
     def __init__(
         self,
-        transport: Any = None,
         max_redirects: int = MAX_REDIRECTS,
         max_body_bytes: int = MAX_BODY_BYTES,
         total_timeout: float = TOTAL_TIMEOUT,
         max_pages_per_provider: int = MAX_PAGES_PER_PROVIDER,
         resolver=None,
+        test_transport: Any = None,
     ):
-        self.transport = transport
         self.max_redirects = max_redirects
         self.max_body_bytes = max_body_bytes
         self.total_timeout = total_timeout
         self.max_pages_per_provider = max_pages_per_provider
         self._resolver = resolver
+        self.transport = test_transport  # TEST-ONLY seam; None in production
         self._page_counts: Dict[str, int] = {}
 
     def fetch(self, url: str, provider_id: str) -> FetchResult:
@@ -213,7 +225,9 @@ class SafeFetcher:
             raise FetcherError("total request timeout exceeded")
         url = parsed.geturl()
         if self.transport is not None:
-            result = self.transport.request(url)
+            # TEST-ONLY seam: the fake MUST honor the pinned IP it is given
+            # (same validated address the production path connects to).
+            result = self.transport.request(url, pinned_ip=pinned_ip)
             if time.monotonic() - start > self.total_timeout:
                 raise FetcherError("total request timeout exceeded")
             status, headers, body = result
@@ -221,44 +235,45 @@ class SafeFetcher:
                 str(key).lower(): str(value) for key, value in dict(headers).items()
             }
             return status, normalized_headers, body
-        return self._real_request(host, port, url, remaining, parsed.scheme, pinned_ip=pinned_ip)
+        return self._real_request(host, port, parsed, remaining, pinned_ip=pinned_ip)
 
     def _real_request(
-        self, host, port, url, timeout, scheme=None, pinned_ip=None
+        self, host, port, parsed, timeout, pinned_ip=None
     ) -> tuple[int, Dict[str, str], bytes]:
         # DNS rebinding protection (FIX-003):
-        # Connect to verified public IP, keep hostname for Host/SNI.
+        # Connect to the verified public IP, keep the hostname for Host/SNI.
         import http.client
         import ssl
 
-        scheme = scheme or urlparse(url).scheme
-        connection_class = (
-            http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-        )
-        # If we have a pinned IP and are doing a real connection, use it.
-        # Otherwise (test mocks) use the standard connection class.
-        if pinned_ip and not getattr(self.transport, "_is_fake", False):
+        url = parsed.geturl()
+        scheme = parsed.scheme
+        try:
+            request_target = parsed.path or "/"
+            if parsed.query:
+                request_target += "?" + parsed.query
+        except ValueError:
+            request_target = "/"
+        if pinned_ip:
+            # Pin the socket to the validated IP; hostname stays in Host/SNI.
+            raw_sock = socket.create_connection((pinned_ip, port), timeout=timeout)
             if scheme == "https":
                 context = ssl.create_default_context()
-                raw_sock = socket.create_connection((pinned_ip, port), timeout=timeout)
                 sock = context.wrap_socket(raw_sock, server_hostname=host)
                 conn = http.client.HTTPSConnection(host, port, timeout=timeout)
                 conn.sock = sock
             else:
-                raw_sock = socket.create_connection((pinned_ip, port), timeout=timeout)
                 conn = http.client.HTTPConnection(host, port, timeout=timeout)
                 conn.sock = raw_sock
         else:
-            # Standard path: connection_class handles socket creation (works with mocks)
+            connection_class = (
+                http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+            )
             conn = connection_class(host, port, timeout=timeout)
-            if pinned_ip and scheme == "https":
-                context = ssl.create_default_context()
-                raw_sock = socket.create_connection((pinned_ip, port), timeout=timeout)
-                conn.sock = context.wrap_socket(raw_sock, server_hostname=host)
-            elif pinned_ip:
-                conn.sock = socket.create_connection((pinned_ip, port), timeout=timeout)
         try:
-            conn.request("GET", url)
+            # Origin-form request target (absolute-form confuses many origins).
+            # http.client derives the Host header from the connection host,
+            # which is the original hostname even when pinned to an IP.
+            conn.request("GET", request_target)
             response = conn.getresponse()
             headers = {str(k).lower(): str(v) for k, v in response.getheaders()}
             self._check_declared_length(headers)

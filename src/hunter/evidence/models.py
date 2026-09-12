@@ -127,24 +127,44 @@ class Evidence(BaseModel):
         provider_id: Optional[str] = None,
         source_type: str = "page",
         claim: Optional[str] = None,
-        content_excerpt: Optional[str] = None,
+        excerpt_length: int = 2000,
         retrieved_at: Optional[datetime] = None,
         candidate_id: Optional[str] = None,
         title: Optional[str] = None,
     ) -> "Evidence":
         """Build evidence from a SafeFetcher FetchResult, populating provenance.
 
-        Only this factory creates Evidence with provenance. Callers must not
-        manually set ``provenance``; the validator checks ``retrieved_from_origin``
-        before granting OFFICIAL.
+        Only this factory creates Evidence with provenance. The content is
+        BOUND to the actually-fetched body (review round 2):
+
+        - the fetch must have returned a 2xx (non-2xx fails closed);
+        - ``content_excerpt`` is derived by truncating the decoded body —
+          caller-supplied excerpt text is never trusted;
+        - ``claim``, when provided, must be a substring of the fetched body
+          so a fabricated claim cannot ride on a real fetch;
+        - ``provenance.content_sha256`` is recomputed from the body bytes,
+          not taken from the caller.
         """
-        sha256 = hashlib.sha256(fetch_result.body).hexdigest()
+        status = int(getattr(fetch_result, "status", 0) or 0)
+        if not (200 <= status < 300):
+            raise ValueError(
+                f"refusing to create evidence from non-2xx fetch (status={status})"
+            )
+        body: bytes = fetch_result.body
+        if not isinstance(body, (bytes, bytearray, memoryview)):
+            raise ValueError("fetch result body is not bytes")
+        body_text = bytes(body).decode("utf-8", errors="replace")
+        if claim is not None and claim not in body_text:
+            raise ValueError("claim is not present in the fetched content")
+        sha256 = hashlib.sha256(bytes(body)).hexdigest()
+        excerpt = body_text[: max(0, int(excerpt_length))]
+        final_url = fetch_result.final_url or fetch_result.original_url
         provenance = EvidenceProvenance(
             retrieval_method="safe_fetch",
-            original_url=fetch_result.original_url,
-            final_url=fetch_result.final_url,
-            redirect_chain=list(fetch_result.redirect_chain),
-            http_status=fetch_result.status,
+            original_url=fetch_result.original_url or final_url,
+            final_url=final_url,
+            redirect_chain=list(fetch_result.redirect_chain or []),
+            http_status=status,
             content_sha256=sha256,
             retrieved_from_origin=True,
             retrieved_at=retrieved_at or fetch_result.retrieved_at or datetime.now(timezone.utc),
@@ -153,13 +173,13 @@ class Evidence(BaseModel):
             evidence_id="",
             candidate_id=candidate_id or provider_id,
             provider_id=provider_id or candidate_id,
-            url=fetch_result.final_url or fetch_result.original_url,
+            url=final_url,
             source_type=source_type,
             officiality=Officiality.UNCONFIRMED,
             retrieved_at=provenance.retrieved_at,
-            title=title or fetch_result.final_url or fetch_result.original_url,
-            claim=claim or "",
-            content_excerpt=content_excerpt or "",
+            title=title or final_url or fetch_result.original_url,
+            claim=claim or excerpt[:300],
+            content_excerpt=excerpt,
             provenance=provenance,
         )
 

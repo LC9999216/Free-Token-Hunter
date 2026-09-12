@@ -112,6 +112,11 @@ class GroundedUrl(BaseModel):
 
     Every non-null ProviderSetup URL must carry an evidence citation:
     which evidence record, the exact quote, and its offsets.
+
+    Review round 2: the URL, evidence_id, and quote must be non-empty; the
+    URL scheme must be http(s); offsets must be non-negative and ordered
+    (0 <= start < end); and :meth:`verify_against` checks the quote actually
+    appears at those offsets in the cited evidence content.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -121,6 +126,43 @@ class GroundedUrl(BaseModel):
     quote: str
     start_offset: int = 0
     end_offset: int = 0
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("grounded url must not be empty")
+        from urllib.parse import urlparse
+
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError(f"grounded url must be http(s): {v!r}")
+        return v
+
+    @field_validator("evidence_id", "quote")
+    @classmethod
+    def _nonempty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("grounded citation fields must be non-empty")
+        return v
+
+    @model_validator(mode="after")
+    def _ordered_offsets(self) -> "GroundedUrl":
+        if self.start_offset < 0 or self.end_offset < 0:
+            raise ValueError("offsets must be non-negative")
+        if self.end_offset <= self.start_offset:
+            raise ValueError("end_offset must be greater than start_offset")
+        return self
+
+    def verify_against(self, evidence: Any) -> bool:
+        """True when the quote exists at exactly these offsets in evidence."""
+        text = getattr(evidence, "content_excerpt", None) or ""
+        if getattr(evidence, "evidence_id", None) != self.evidence_id:
+            return False
+        if self.end_offset > len(text):
+            return False
+        return text[self.start_offset : self.end_offset] == self.quote
 
 
 class ProviderSetup(BaseModel):

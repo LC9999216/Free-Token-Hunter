@@ -111,18 +111,21 @@ class Pipeline:
                     continue
                 if not 200 <= result.status < 300:
                     continue
-                text = result.body.decode("utf-8", errors="replace")
-                excerpt = _plain_text_excerpt(text)[:4000]
-                evidence = Evidence.from_fetch(
-                    result,
-                    provider_id=candidate.candidate_id,
-                    source_type=_guess_source_type(result.final_url or url),
-                    claim=excerpt[:300],
-                    content_excerpt=excerpt,
-                    retrieved_at=self.as_of,
-                    candidate_id=candidate.candidate_id,
-                    title=result.final_url or url,
-                )
+                # The excerpt and claim are DERIVED from the fetched body inside
+                # from_fetch so the stored evidence stays bound to the content
+                # the SafeFetcher actually retrieved (no caller-supplied text).
+                try:
+                    evidence = Evidence.from_fetch(
+                        result,
+                        provider_id=candidate.candidate_id,
+                        source_type=_guess_source_type(result.final_url or url),
+                        excerpt_length=4000,
+                        retrieved_at=self.as_of,
+                        candidate_id=candidate.candidate_id,
+                        title=result.final_url or url,
+                    )
+                except ValueError:
+                    continue
                 if self.evidence_store.upsert(evidence):
                     created += 1
         self._resolution_ready = False
