@@ -46,11 +46,18 @@ class ProcessFileLock:
         self._fd: "int | None" = None
         self._key = str(self.path.resolve(strict=False)).lower()
 
-    def acquire(self, timeout: float = 0.0) -> None:
-        """Acquire the lock, raising LockHeldError if another process has it."""
+    def acquire(self, timeout: float = 0.0, reentrant: bool = True) -> None:
+        """Acquire the lock, raising LockHeldError if another process has it.
+
+        Args:
+            timeout: 0.0 (default) -> one attempt; >0 -> spin up to ``timeout`` seconds.
+            reentrant: True (default) allows same-process re-entry without a real OS
+                       lock attempt; False forces a new OS lock even in the same process.
+        """
         with ProcessFileLock._held_mutex:
-            if ProcessFileLock._held.get(self._key, 0) > 0:
-                ProcessFileLock._held[self._key] += 1
+            count = ProcessFileLock._held.get(self._key, 0)
+            if count > 0 and reentrant:
+                ProcessFileLock._held[self._key] = count + 1
                 return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)

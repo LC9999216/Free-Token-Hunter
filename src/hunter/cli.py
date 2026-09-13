@@ -118,6 +118,15 @@ def build_parser() -> argparse.ArgumentParser:
     alias.add_argument("--data-dir", default=None)
     alias.set_defaults(handler=_handle_pipeline)
 
+    # Stage 2 subcommands (nested parsers; handlers live in cli_imports and
+    # delegate to hunter.runtime.stage2 workers — no business logic here).
+    try:
+        from .cli_imports import register_stage_two_parsers
+
+        register_stage_two_parsers(subparsers)
+    except ImportError:  # pragma: no cover - defensive
+        pass
+
     for name, (help_text, handler) in sorted(_SUBCOMMANDS.items()):
         sub = subparsers.add_parser(name, help=help_text)
         sub.set_defaults(handler=handler)
