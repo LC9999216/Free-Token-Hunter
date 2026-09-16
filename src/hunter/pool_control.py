@@ -31,12 +31,14 @@ Key isolation rules (review round 2, 二):
 from __future__ import annotations
 
 import getpass
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .pool_toml import (
+    atomic_write_json,
     atomic_write_toml,
     read_config_keys,
     read_providers_toml,
@@ -44,6 +46,7 @@ from .pool_toml import (
     render_providers_toml,
     verify_permissions,
 )
+from .pool_proxy import ProxySupervisor
 
 logger = logging.getLogger("hunter.pool_control")
 
@@ -198,6 +201,7 @@ class PoolControl:
         *,
         read_secret: Callable[[str], str] = getpass.getpass,
         probe_runner: Optional[FreellmpoolProbeRunner] = None,
+        proxy_supervisor: Optional[ProxySupervisor] = None,
         hunter_root: Optional[Path] = None,
     ):
         self.staging_dir = Path(staging_dir)
@@ -206,9 +210,10 @@ class PoolControl:
         self.production_dir.mkdir(parents=True, exist_ok=True)
         self._read_secret = read_secret
         self._probe_runner = probe_runner
+        self._proxy_supervisor = proxy_supervisor
         self._hunter_root = Path(hunter_root).resolve() if hunter_root else None
         self.ensure_isolated()
-        self._production_halted = False
+        self._production_halted, self._halt_reason = self._load_control_state()
         self._last_probe: Dict[str, ProbeOutcome] = {}
 
     # -- isolation ----------------------------------------------------------
@@ -251,6 +256,48 @@ class PoolControl:
     def production_config_path(self) -> Path:
         return self.production_dir / "config.toml"
 
+    @property
+    def control_state_path(self) -> Path:
+        return self.production_dir / "control_state.json"
+
+    def _load_control_state(self) -> tuple[bool, Optional[str]]:
+        if not self.control_state_path.is_file():
+            return False, None
+        try:
+            payload = json.loads(self.control_state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PoolControlError("invalid_control_state") from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"production_halted", "reason"}
+            or not isinstance(payload["production_halted"], bool)
+            or not isinstance(payload["reason"], str)
+        ):
+            raise PoolControlError("invalid_control_state")
+        return payload["production_halted"], payload["reason"]
+
+    def _persist_halt(self, reason: str) -> None:
+        try:
+            atomic_write_json(
+                self.control_state_path,
+                {"production_halted": True, "reason": reason},
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise PoolControlError("control_state_write_failed") from exc
+        self._production_halted = True
+        self._halt_reason = reason
+
+    def _clear_halt(self) -> None:
+        try:
+            atomic_write_json(
+                self.control_state_path,
+                {"production_halted": False, "reason": ""},
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise PoolControlError("control_state_write_failed") from exc
+        self._production_halted = False
+        self._halt_reason = None
+
     def _staging_providers(self) -> List[Dict[str, Any]]:
         return read_providers_toml(self.staging_providers_path)
 
@@ -274,6 +321,27 @@ class PoolControl:
     ) -> None:
         atomic_write_toml(self.production_providers_path, render_providers_toml(providers))
         atomic_write_toml(self.production_config_path, render_config_toml(keys))
+
+    def _restore_production(
+        self, providers: List[Dict[str, Any]], keys: Dict[str, str]
+    ) -> None:
+        try:
+            self._write_production(providers, keys)
+        except (OSError, ValueError):
+            logger.error("production rollback failed")
+
+    def _halt_after_live_failure(self, reason: str) -> bool:
+        try:
+            self._persist_halt(reason)
+        except PoolControlError:
+            logger.error("production halt latch persistence failed")
+            return False
+        if self._proxy_supervisor is not None:
+            try:
+                self._proxy_supervisor.halt()
+            except Exception:  # noqa: BLE001 - containment is best effort
+                logger.error("production proxy halt failed")
+        return True
 
     # -- registration & key entry ---------------------------------------------
 
@@ -528,11 +596,13 @@ class PoolControl:
                 "error": "key_missing_in_staging",
             }
 
+        previous_providers = self._production_providers()
+        previous_keys = self._production_keys()
         production_providers = [
-            p for p in self._production_providers() if p.get("id") != provider_id
+            p for p in previous_providers if p.get("id") != provider_id
         ]
         production_providers.append(record)
-        production_keys = dict(self._production_keys())
+        production_keys = dict(previous_keys)
         production_keys[key_env] = staging_keys[key_env]
         try:
             self._write_production(production_providers, production_keys)
@@ -546,11 +616,45 @@ class PoolControl:
 
         # READBACK: production catalog must contain the provider with its key.
         if not self._readback_configured(provider_id, self.production_dir):
+            self._restore_production(previous_providers, previous_keys)
             return {
                 "provider_id": provider_id,
                 "promoted": False,
                 "error": "production_readback_failed",
             }
+        if self._proxy_supervisor is not None:
+            try:
+                self._proxy_supervisor.reload()
+            except Exception:  # noqa: BLE001 - raw proxy errors may contain secrets
+                self._restore_production(previous_providers, previous_keys)
+                if not self._halt_after_live_failure("promotion_reload_failed"):
+                    return {
+                        "provider_id": provider_id,
+                        "promoted": False,
+                        "error": "control_state_write_failed",
+                    }
+                return {
+                    "provider_id": provider_id,
+                    "promoted": False,
+                    "error": "live_proxy_reload_failed",
+                }
+            try:
+                loaded = self._proxy_supervisor.running_provider_ids()
+            except Exception:  # noqa: BLE001 - fail closed on unavailable readback
+                loaded = set()
+            if provider_id not in loaded:
+                self._restore_production(previous_providers, previous_keys)
+                if not self._halt_after_live_failure("promotion_readback_failed"):
+                    return {
+                        "provider_id": provider_id,
+                        "promoted": False,
+                        "error": "control_state_write_failed",
+                    }
+                return {
+                    "provider_id": provider_id,
+                    "promoted": False,
+                    "error": "live_proxy_readback_failed",
+                }
         logger.info("promoted %s to production (verified by readback)", provider_id)
         return {"provider_id": provider_id, "promoted": True, "error": None}
 
@@ -576,47 +680,86 @@ class PoolControl:
         record = next(
             (p for p in production_providers if p.get("id") == provider_id), None
         )
+        previous_keys = self._production_keys()
         if record is None:
-            return {
-                "provider_id": provider_id,
-                "suspended": True,
-                "error": None,
-                "already_absent": True,
+            remaining = production_providers
+            production_keys = previous_keys
+        else:
+            remaining = [p for p in production_providers if p.get("id") != provider_id]
+            key_env = str(record.get("key_env") or "")
+            production_keys = {
+                k: v for k, v in previous_keys.items() if k != key_env
             }
-        remaining = [p for p in production_providers if p.get("id") != provider_id]
-        key_env = str(record.get("key_env") or "")
-        production_keys = {
-            k: v for k, v in self._production_keys().items() if k != key_env
-        }
-        try:
-            self._write_production(remaining, production_keys)
-        except (OSError, ValueError):
-            logger.error("suspend write failed for %s", provider_id)
-            return {
-                "provider_id": provider_id,
-                "suspended": False,
-                "error": "production_write_failed",
-            }
-        still_there = any(
-            p.get("id") == provider_id for p in self._production_providers()
-        )
+            try:
+                self._write_production(remaining, production_keys)
+            except (OSError, ValueError):
+                logger.error("suspend write failed for %s", provider_id)
+                return {
+                    "provider_id": provider_id,
+                    "suspended": False,
+                    "error": "production_write_failed",
+                }
+        still_there = any(p.get("id") == provider_id for p in self._production_providers())
         if still_there:
             return {
                 "provider_id": provider_id,
                 "suspended": False,
                 "error": "production_readback_failed",
             }
-        return {"provider_id": provider_id, "suspended": True, "error": None}
+        if self._proxy_supervisor is not None:
+            try:
+                self._proxy_supervisor.reload()
+            except Exception:  # noqa: BLE001 - raw proxy errors may contain secrets
+                if not self._halt_after_live_failure("suspension_reload_failed"):
+                    return {
+                        "provider_id": provider_id,
+                        "suspended": False,
+                        "error": "control_state_write_failed",
+                    }
+                return {
+                    "provider_id": provider_id,
+                    "suspended": False,
+                    "error": "live_proxy_reload_failed",
+                }
+            try:
+                loaded = self._proxy_supervisor.running_provider_ids()
+            except Exception:  # noqa: BLE001 - fail closed on unavailable readback
+                loaded = {provider_id}
+            if provider_id in loaded:
+                if not self._halt_after_live_failure("suspension_readback_failed"):
+                    return {
+                        "provider_id": provider_id,
+                        "suspended": False,
+                        "error": "control_state_write_failed",
+                    }
+                return {
+                    "provider_id": provider_id,
+                    "suspended": False,
+                    "error": "live_proxy_readback_failed",
+                }
+        response = {"provider_id": provider_id, "suspended": True, "error": None}
+        if record is None:
+            response["already_absent"] = True
+        return response
 
-    def stop_production(self) -> Dict[str, Any]:
+    def stop_production(self, reason: str = "manual_stop") -> Dict[str, Any]:
         """Halt the production pool: no further promotions; production marked
         blocked so clients can be reconfigured away (review 四.4 containment)."""
-        self._production_halted = True
-        logger.error("production pool HALTED (suspend failure containment)")
+        try:
+            self._persist_halt(reason)
+        except PoolControlError:
+            return {"halted": False, "error": "control_state_write_failed"}
+        if self._proxy_supervisor is not None:
+            try:
+                self._proxy_supervisor.halt()
+            except Exception:  # noqa: BLE001 - latch remains the containment authority
+                logger.error("production proxy halt failed")
+                return {"halted": True, "error": "proxy_halt_failed"}
+        logger.error("production pool HALTED")
         return {"halted": True}
 
     def resume_production(self) -> Dict[str, Any]:
-        self._production_halted = False
+        self._clear_halt()
         return {"halted": False}
 
     @property

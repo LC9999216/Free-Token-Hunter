@@ -648,6 +648,15 @@ def test_http_api_probe_classified_via_runner(tmp_path: Path) -> None:
         server.shutdown()
 
 
+def test_http_api_does_not_expose_remote_resume(tmp_path: Path) -> None:
+    server, client = _serve(_control(tmp_path))
+    try:
+        with pytest.raises(PoolApiError, match="not_found"):
+            client._request("POST", "/pool/resume", body={})
+    finally:
+        server.shutdown()
+
+
 def test_http_api_rejects_key_material_in_body(tmp_path: Path) -> None:
     import urllib.request
 

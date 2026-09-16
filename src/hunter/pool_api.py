@@ -199,10 +199,6 @@ class PoolControlHandler(BaseHTTPRequestHandler):
             result = self.pool_control.stop_production()
             self._json_response(200, result)
             return
-        if path == "/pool/resume":
-            result = self.pool_control.resume_production()
-            self._json_response(200, result)
-            return
         match = _ACTION_ROUTE.match(path)
         if match is None:
             self._deny(404, "not_found")
@@ -347,10 +343,6 @@ class PoolControlClient:
 
     def stop_production(self) -> Dict[str, Any]:
         return self._request("POST", "/pool/stop", body={})
-
-    def resume_production(self) -> Dict[str, Any]:
-        return self._request("POST", "/pool/resume", body={})
-
 
 __all__ = [
     "PoolControlServer",

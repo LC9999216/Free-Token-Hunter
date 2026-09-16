@@ -18,6 +18,7 @@ Review round 2 (二.4/二.5):
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import tomllib
@@ -173,6 +174,31 @@ def atomic_write_toml(path: Path, content: str) -> None:
         raise
 
 
+def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Validate, fsync, and atomically replace a small control-state file."""
+    content = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    parsed = json.loads(content)
+    if not isinstance(parsed, dict):
+        raise ValueError("serialized JSON did not parse to an object")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+        _apply_mode(path)
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def read_providers_toml(path: Path) -> List[Dict[str, Any]]:
     """Parse a providers.toml into a list of provider dicts."""
     if not path.is_file():
@@ -210,6 +236,7 @@ __all__ = [
     "render_providers_toml",
     "render_config_toml",
     "atomic_write_toml",
+    "atomic_write_json",
     "read_providers_toml",
     "read_config_keys",
     "verify_permissions",
