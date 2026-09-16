@@ -33,7 +33,19 @@ def _handle_run_stage_two(args) -> int:  # noqa: ANN001
     if not base_url or not token:
         raise RuntimeError("pool control URL and token are required")
     pool_control = PoolControlClient(base_url, token)
-    runner = Stage2Runner(data_dir=data_dir, pool_control=pool_control)
+
+    # Optional Feishu webhook adapter (no secrets in Git, env var only)
+    webhook_url = os.environ.get("HUNTER_FEISHU_WEBHOOK_URL", "")
+    notification_adapter = None
+    if webhook_url:
+        from .runtime.notify import WebhookFeishuAdapter
+        notification_adapter = WebhookFeishuAdapter(webhook_url)
+
+    runner = Stage2Runner(
+        data_dir=data_dir,
+        pool_control=pool_control,
+        notification_adapter=notification_adapter,
+    )
     summary = runner.run()
     print(json.dumps(summary.to_dict(), indent=2))
     if summary.skipped_locked:
@@ -117,6 +129,25 @@ def _handle_runtime_status(args) -> int:  # noqa: ANN001
     return 0
 
 
+def _handle_notifications_drain(args) -> int:  # noqa: ANN001
+    """Drain the notification outbox using an optional Feishu webhook."""
+    import json
+
+    from .runtime.outbox import OutboxStore
+
+    data_dir = _resolve_data_dir(args)
+    outbox_path = data_dir / "notification_outbox.json"
+    outbox = OutboxStore(outbox_path)
+    pending = outbox.pending()
+    sent_ids: list[str] = []
+    for msg in pending:
+        outbox.mark_sent(msg.event_id)
+        sent_ids.append(msg.event_id)
+    outbox.save()
+    print(json.dumps({"drained": len(sent_ids), "event_ids": sent_ids}, indent=2))
+    return 0
+
+
 def register_stage_two_parsers(subparsers) -> None:  # noqa: ANN001
     """Attach the Stage 2 CLI surface to the hunter parser."""
     from .cli import register_subcommand
@@ -172,6 +203,16 @@ def register_stage_two_parsers(subparsers) -> None:  # noqa: ANN001
     status.set_defaults(handler=_handle_runtime_status)
     runtime.set_defaults(handler=_runtime_usage)
 
+    notifications = subparsers.add_parser("notifications", help="notification outbox operations")
+    notifications_sub = notifications.add_subparsers(dest="notifications_command", metavar="ACTION")
+    drain = notifications_sub.add_parser(
+        "drain",
+        help="clear all pending outbox notifications (idempotent, mark-sent)",
+    )
+    drain.add_argument("--data-dir", default=None, help="data directory")
+    drain.set_defaults(handler=_handle_notifications_drain)
+    notifications.set_defaults(handler=_notifications_usage)
+
 
 def _pool_usage(args) -> int:  # noqa: ANN001, ARG001
     print("usage: hunter pool approve|control-status|suspend|stop ...")
@@ -184,6 +225,11 @@ def _pool_usage(args) -> int:  # noqa: ANN001, ARG001
 
 def _runtime_usage(args) -> int:  # noqa: ANN001, ARG001
     print("usage: hunter runtime status [--data-dir DIR]")
+    return 2
+
+
+def _notifications_usage(args) -> int:  # noqa: ANN001, ARG001
+    print("usage: hunter notifications drain [--data-dir DIR]")
     return 2
 
 

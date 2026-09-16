@@ -416,9 +416,10 @@ def test_run_stage_two_cli_uses_pool_client_only(tmp_path: Path, monkeypatch) ->
             captured["token"] = token
 
     class FakeRunner:
-        def __init__(self, *, data_dir: Path, pool_control: object):
+        def __init__(self, *, data_dir: Path, pool_control: object, notification_adapter=None, **kw):
             captured["data_dir"] = data_dir
             captured["pool_control"] = pool_control
+            captured["notification_adapter"] = notification_adapter
 
         def run(self):
             return SimpleNamespace(
@@ -705,3 +706,68 @@ def test_cli_pool_suspend_refuses_without_confirm(tmp_path: Path) -> None:
     # argparse exits on missing required argument, so catch sys.exit
     with pytest.raises((SystemExit, RuntimeError)):
         cli_main(["pool", "suspend", "--provider-id", "acme"])
+
+
+# =============================================================================
+# Feishu webhook wiring and outbox drain (Problem 1.4.2D)
+# =============================================================================
+
+
+def test_notifications_drain_command(tmp_path: Path, capsys) -> None:
+    """hunter notifications drain clears pending outbox entries."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    # Seed a pending outbox message
+    from hunter.runtime.outbox import OutboxStore
+    from hunter.runtime.models import RuntimeProvider
+    from hunter.runtime.store import RuntimeStore
+    store = RuntimeStore(data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl")
+    store.upsert(RuntimeProvider(provider_id="acme"), reason="setup")
+    outbox = OutboxStore(data_dir / "notification_outbox.json")
+    from hunter.runtime.outbox import OutboxMessage
+    msg = OutboxMessage(
+        event_id="test-ev-001",
+        provider_id="acme",
+        provider_name="Acme AI",
+        event_type="NEW_HIGH_VALUE",
+        title="Test notification",
+        body="Test body",
+    )
+    from hunter.runtime.notify import build_feishu_payload
+    outbox.enqueue(msg)
+    assert len(outbox.pending()) == 1
+    code = cli_main(["notifications", "drain", "--data-dir", str(data_dir)])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert '"drained": 1' in out
+    # Outbox should now have 0 pending
+    outbox2 = OutboxStore(data_dir / "notification_outbox.json")
+    assert len(outbox2.pending()) == 0
+
+
+def test_run_stage_two_wires_feishu_adapter(monkeypatch, tmp_path) -> None:
+    """run-stage-two wires WebhookFeishuAdapter when env var is set."""
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", "http://127.0.0.1:8091")
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    monkeypatch.setenv("HUNTER_FEISHU_WEBHOOK_URL", "https://hooks.feishu.cn/custom/test")
+    captured_adapter = {"value": None}
+    captured_runner = {"kwargs": None}
+
+    class FakeClient:
+        def __init__(self, url, token):
+            pass
+
+    class FakeRunner:
+        def __init__(self, *, data_dir, pool_control, notification_adapter, **kw):
+            captured_runner["kwargs"] = {"pool_control": pool_control, "notification_adapter": notification_adapter}
+        def run(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(to_dict=lambda: {"skipped_locked": False}, skipped_locked=False, suspend_failed=[], pool_runtime_split=[])
+
+    monkeypatch.setattr("hunter.pool_api.PoolControlClient", FakeClient)
+    monkeypatch.setattr("hunter.runtime.stage2.Stage2Runner", FakeRunner)
+    from hunter.cli import main as cli_entry
+    code = cli_entry(["run-stage-two", "--data-dir", str(tmp_path)])
+    assert code == 0
+    assert captured_runner["kwargs"]["notification_adapter"] is not None
+    assert "Webhook" in type(captured_runner["kwargs"]["notification_adapter"]).__name__
