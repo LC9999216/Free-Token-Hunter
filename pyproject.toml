@@ -30,6 +30,9 @@ hunter-pool-control = "hunter.pool_service:main"
 dev = [
     "pytest>=8.0",
 ]
+stage2 = [
+    "freellmpool==0.13.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

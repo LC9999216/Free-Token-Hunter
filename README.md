@@ -119,3 +119,24 @@ faked. The pinned upstream fixture (`tests/fixtures/upstream/free-llm-api-hub-v2
 in the repo so every run is reproducible.
 
 See `CODEX_TASKS_000_010.md` for the authoritative task breakdown.
+
+## Optional Stage 2 Pool Control service
+
+Stage 2 is separate from the Stage 1 confirmation pipeline. Install its exact
+runtime dependency in the isolated Pool Control environment:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,stage2]"
+.\.venv\Scripts\python.exe -c "import freellmpool; assert freellmpool.__version__ == '0.13.0'"
+```
+
+Set the named environment variables in the relevant local process environments
+without recording their values: `HUNTER_POOL_CONTROL_TOKEN`,
+`HUNTER_POOL_CONTROL_URL`, and `FREELLMPOOL_PROXY_KEY`.
+
+Start `hunter-pool-control serve` in the isolated Pool Control environment,
+then run `python -m hunter run-stage-two` in the Hunter environment. The
+Pool Control service owns the provider TOML files, provider keys, and
+FreeLLMPool proxy. A nonzero exit code is fail-closed and requires operator
+review before retrying.

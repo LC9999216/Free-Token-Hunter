@@ -88,6 +88,7 @@ def build_service(
         host=host,
         proxy_port=proxy_port,
     )
+    FreellmpoolProbeRunner().check_version()
     server = PoolControlServer(control, token, host=host, port=port)
     return PoolService(
         pool_control=control,

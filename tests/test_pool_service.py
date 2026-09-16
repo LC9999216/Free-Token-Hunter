@@ -56,6 +56,28 @@ def test_service_rejects_missing_control_token(tmp_path: Path, monkeypatch) -> N
         )
 
 
+def test_service_checks_freellmpool_version_before_binding(
+    tmp_path: Path, monkeypatch
+) -> None:
+    checked: list[bool] = []
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    monkeypatch.setattr(
+        "hunter.pool_service.FreellmpoolProbeRunner.check_version",
+        lambda self: checked.append(True),
+    )
+    service = build_service(
+        staging_dir=tmp_path / "staging",
+        production_dir=tmp_path / "production",
+        host="127.0.0.1",
+        port=0,
+        proxy_port=8080,
+    )
+    try:
+        assert checked == [True]
+    finally:
+        service.control_server.close()
+
+
 def test_service_does_not_start_proxy_while_halted() -> None:
     supervisor = FakeServiceSupervisor([])
     server = FakeControlServer()
