@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +38,12 @@ class FakeProxySupervisor:
 
     def force_loaded(self, provider_ids: list[str]) -> None:
         self._provider_ids = set(provider_ids)
+
+
+class RaisingProxySupervisor(FakeProxySupervisor):
+    def reload(self) -> None:
+        self.reload_calls += 1
+        raise RuntimeError("synthetic reload failure without secret material")
 
 
 class FakeServer:
@@ -174,3 +181,55 @@ def test_proxy_supervisor_rejects_noncanonical_loopback(tmp_path: Path) -> None:
             tmp_path / "config.toml",
             host="localhost",
         )
+
+
+def test_promotion_reload_failure_restores_config_and_persists_halt(
+    tmp_path: Path,
+) -> None:
+    supervisor = RaisingProxySupervisor([])
+    control = _control(tmp_path, proxy_supervisor=supervisor)
+    _registered_with_key(control)
+    result = control.promote("acme")
+    assert result["promoted"] is False
+    assert result["error"] == "live_proxy_reload_failed"
+    assert control.list_production() == []
+    assert supervisor.running_provider_ids() == set()
+    rebuilt = _control(tmp_path, proxy_supervisor=FakeProxySupervisor([]))
+    assert rebuilt.production_halted is True
+
+
+def test_promotion_readback_failure_halts_and_removes_live_provider(
+    tmp_path: Path,
+) -> None:
+    supervisor = FakeProxySupervisor([])
+    control = _control(tmp_path, proxy_supervisor=supervisor)
+    _registered_with_key(control)
+    result = control.promote("acme")
+    assert result["error"] == "live_proxy_readback_failed"
+    assert control.list_production() == []
+    assert control.production_halted is True
+
+
+def test_suspension_reload_failure_never_reports_suspended(tmp_path: Path) -> None:
+    supervisor = FakeProxySupervisor(["acme"])
+    control = _control(tmp_path, proxy_supervisor=supervisor)
+    _registered_with_key(control)
+    assert control.promote("acme")["promoted"] is True
+    supervisor.fail_reload = True
+    result = control.suspend("acme")
+    assert result["suspended"] is False
+    assert result["error"] == "live_proxy_reload_failed"
+    assert control.production_halted is True
+
+
+def test_failure_artifacts_never_contain_secret(tmp_path: Path, caplog) -> None:
+    supervisor = RaisingProxySupervisor([])
+    control = _control(tmp_path, proxy_supervisor=supervisor)
+    _registered_with_key(control)
+    result = control.promote("acme")
+    artifacts = json.dumps(result) + caplog.text
+    artifacts += control.production_providers_path.read_text(encoding="utf-8")
+    artifacts += (control.production_dir / "control_state.json").read_text(
+        encoding="utf-8"
+    )
+    assert "test-provider-key" not in artifacts

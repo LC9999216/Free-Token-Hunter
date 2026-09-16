@@ -565,6 +565,10 @@ def promote_to_production(
                     ),
                 ),
             )
+            return LifecycleResult(
+                provider_id=provider_id, gates=gates, success=False,
+                error="runtime_store_write_failed_split",
+            )
         return LifecycleResult(
             provider_id=provider_id, gates=gates, success=False,
             error="runtime_store_write_failed_rolled_back",

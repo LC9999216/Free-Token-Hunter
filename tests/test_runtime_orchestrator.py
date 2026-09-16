@@ -631,6 +631,7 @@ def test_promote_state_split_halts_production_and_alerts(tmp_path: Path) -> None
         outbox_store=outbox,
     )
     assert result.success is False
+    assert result.error == "runtime_store_write_failed_split"
     assert pc.production_halted is True
     alerts = [m for m in outbox.pending() if m.event_type == "POOL_STATE_SPLIT"]
     assert len(alerts) == 1
