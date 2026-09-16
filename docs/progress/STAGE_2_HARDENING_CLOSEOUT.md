@@ -34,8 +34,23 @@
 - Stage 2 security suite: `182 passed, 1 skipped`.
 - Dependency metadata assertion passed; installed `freellmpool` assertion was
   locally verified as `0.13.0`.
-- Final full-suite, compile, CLI, diff, data-hash and clean-worktree results
-  are recorded only after Task 9 completes.
+
+## Final offline acceptance
+
+- Complete suite, serial run 1: `626 passed, 1 skipped in 245.13s`.
+- Complete suite, serial run 2: `626 passed, 1 skipped in 219.79s`.
+  The sole skip is the POSIX-only permission-bit assertion on Windows.
+- `python -B -m compileall -q src`: passed.
+- `git diff --check 02ce0f9..HEAD`: passed with no output.
+- `python -m hunter --help`, `python -m hunter pool --help`,
+  `python -m hunter runtime --help`, and `hunter-pool-control --help`: passed.
+- `freellmpool.__version__ == "0.13.0"`: passed.
+- Protected data SHA-256 remained unchanged:
+  - `data/providers.json`: `B885DA24472E10286974AA98030ADB28EA5C66DCF61947B1040B2AECA9A41EBB`
+  - `data/candidates.json`: `AA40A455096FE39B5E7195CD101BAAA45160B8248F9DF0932B62DFBB9819B61D`
+  - `data/evidence.json`: `8B04685F9AA082FB693DC2C04BB566AD81A117BE365D4E4E4D2F2C10F19A6A05`
+  - `data/history.jsonl`: `910D1811363F26A29225EFB27AF0DEFF32C6BBF717E9D0EEDD494D2CA71A0727`
+- Ruff, mypy, and bandit are not configured in `pyproject.toml`; none was run.
 
 ## Live verification
 
