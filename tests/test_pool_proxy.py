@@ -134,6 +134,15 @@ def test_suspend_requires_provider_absent_from_live_proxy(tmp_path: Path) -> Non
     assert supervisor.halt_calls == 1
 
 
+def test_list_production_reads_live_proxy_not_toml(tmp_path: Path) -> None:
+    supervisor = FakeProxySupervisor(["acme"])
+    control = _control(tmp_path, proxy_supervisor=supervisor)
+    _registered_with_key(control)
+    assert control.promote("acme")["promoted"] is True
+    supervisor.force_loaded([])
+    assert control.list_production() == []
+
+
 def test_proxy_supervisor_reload_replaces_server_and_reads_loaded_ids(
     tmp_path: Path,
 ) -> None:

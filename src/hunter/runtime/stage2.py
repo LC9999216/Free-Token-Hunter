@@ -33,10 +33,9 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
 
 from ..evidence.store import EvidenceStore
-from ..pool_control import PoolControl
 from ..registry.schema import ProviderStatus
 from ..registry.store import ProviderRegistry
 from .locks import LockHeldError, ProcessFileLock
@@ -72,6 +71,24 @@ _INVALID_PRODUCTION_STATUSES = {
 
 class Stage2Error(Exception):
     """Structured Stage 2 runner failure."""
+
+
+class PoolControlPort(Protocol):
+    """Sanitized Pool Control operations available to the Hunter process."""
+
+    def status(self, provider_id: str) -> Any: ...
+
+    def probe(
+        self, provider_id: str, features: Sequence[str], timeout: float = 20.0
+    ) -> Dict[str, Any]: ...
+
+    def promote(self, provider_id: str) -> Dict[str, Any]: ...
+
+    def suspend(self, provider_id: str) -> Dict[str, Any]: ...
+
+    def stop_production(self) -> Dict[str, Any]: ...
+
+    def list_production(self) -> List[str]: ...
 
 
 @dataclass
@@ -121,7 +138,7 @@ class Stage2Runner:
         self,
         *,
         data_dir: Path,
-        pool_control: PoolControl,
+        pool_control: PoolControlPort,
         registry: Optional[ProviderRegistry] = None,
         evidence_store: Optional[EvidenceStore] = None,
         outbox_path: Optional[Path] = None,

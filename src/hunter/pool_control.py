@@ -448,7 +448,12 @@ class PoolControl:
         )
 
     def list_production(self) -> List[str]:
-        """Provider ids currently in the production catalog (readback)."""
+        """Provider ids loaded by the live proxy, or TOML for test-only use."""
+        if self._proxy_supervisor is not None:
+            try:
+                return sorted(self._proxy_supervisor.running_provider_ids())
+            except Exception:  # noqa: BLE001 - missing live readback is empty
+                return []
         return sorted(
             str(p.get("id")) for p in self._production_providers() if p.get("id")
         )

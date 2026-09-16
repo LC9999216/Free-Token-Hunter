@@ -23,19 +23,16 @@ def _resolve_data_dir(args) -> "Path":  # noqa: ANN001
 
 def _handle_run_stage_two(args) -> int:  # noqa: ANN001
     import json
-    from pathlib import Path
 
-    from .pool_control import PoolControl
+    from .pool_api import PoolControlClient
     from .runtime.stage2 import Stage2Runner
 
     data_dir = _resolve_data_dir(args)
-    base = Path(
-        os.environ.get("HUNTER_POOL_BASE_DIR") or (Path.home() / ".hunter-pool")
-    )
-    staging = Path(args.staging_dir) if args.staging_dir else base / "staging"
-    production = Path(args.production_dir) if args.production_dir else base / "production"
-    repo_root = Path(__file__).resolve().parents[2]
-    pool_control = PoolControl(staging, production, hunter_root=repo_root)
+    base_url = os.environ.get("HUNTER_POOL_CONTROL_URL", "")
+    token = os.environ.get("HUNTER_POOL_CONTROL_TOKEN", "")
+    if not base_url or not token:
+        raise RuntimeError("pool control URL and token are required")
+    pool_control = PoolControlClient(base_url, token)
     runner = Stage2Runner(data_dir=data_dir, pool_control=pool_control)
     summary = runner.run()
     print(json.dumps(summary.to_dict(), indent=2))
@@ -81,8 +78,6 @@ def register_stage_two_parsers(subparsers) -> None:  # noqa: ANN001
         help="run the full stage-two lifecycle (lock→reconcile→suspend-first→import→checks→promote→verify)",
     )
     run_two.add_argument("--data-dir", default=None, help="data directory")
-    run_two.add_argument("--staging-dir", default=None, help="pool staging directory")
-    run_two.add_argument("--production-dir", default=None, help="pool production directory")
     run_two.set_defaults(handler=_handle_run_stage_two)
 
     pool = subparsers.add_parser("pool", help="pool control operations")

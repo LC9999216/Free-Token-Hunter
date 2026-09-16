@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 hunter = "hunter.cli:main"
+hunter-pool-control = "hunter.pool_service:main"
 
 [project.optional-dependencies]
 dev = [

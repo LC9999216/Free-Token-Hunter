@@ -39,6 +39,7 @@ MAX_BODY_BYTES = 8 * 1024
 
 _STATUS_ROUTE = re.compile(r"^/providers/(?P<provider_id>[^/]+)/status$")
 _ACTION_ROUTE = re.compile(r"^/providers/(?P<provider_id>[^/]+)/(?P<action>probe|promote|suspend)$")
+_POOL_STATUS_ROUTE = "/pool/status"
 
 _FORBIDDEN_BODY_KEYS = {
     "key", "api_key", "apikey", "secret", "token", "password", "authorization",
@@ -166,7 +167,17 @@ class PoolControlHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._deny(401, "unauthorized")
             return
-        match = _STATUS_ROUTE.match(self.path.split("?")[0])
+        path = self.path.split("?")[0]
+        if path == _POOL_STATUS_ROUTE:
+            self._json_response(
+                200,
+                {
+                    "production_ids": self.pool_control.list_production(),
+                    "production_halted": self.pool_control.production_halted,
+                },
+            )
+            return
+        match = _STATUS_ROUTE.match(path)
         if match is None:
             self._deny(404, "not_found")
             return
@@ -280,6 +291,9 @@ class PoolControlServer:
         self._httpd.shutdown()
         self._httpd.server_close()
 
+    def close(self) -> None:
+        self._httpd.server_close()
+
 
 class PoolControlClient:
     """Hunter-side client. Same method surface as PoolControl; no keys cross."""
@@ -343,6 +357,16 @@ class PoolControlClient:
 
     def stop_production(self) -> Dict[str, Any]:
         return self._request("POST", "/pool/stop", body={})
+
+    def pool_status(self) -> Dict[str, Any]:
+        return self._request("GET", _POOL_STATUS_ROUTE)
+
+    def list_production(self) -> list[str]:
+        payload = self.pool_status()
+        ids = payload.get("production_ids")
+        if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+            raise PoolApiError("invalid_pool_status")
+        return sorted(set(ids))
 
 __all__ = [
     "PoolControlServer",

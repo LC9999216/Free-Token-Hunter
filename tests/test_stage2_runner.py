@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,7 @@ from hunter.auto_suspend import AutoSuspendPolicy
 from hunter.cli import main as cli_main
 from hunter.evidence.models import Evidence
 from hunter.evidence.store import EvidenceStore
+from hunter.pool_api import PoolControlServer
 from hunter.pool_control import PoolControl
 from hunter.registry.schema import FreeOffer, Provider, ProviderStatus
 from hunter.registry.store import ProviderRegistry
@@ -388,25 +390,46 @@ def test_cli_run_stage_two_offline(
         outside_repo_tmp_path / "data", hunter_root=None
     )
     _drive_to_approval(data_dir, pool)
-    # point the CLI at a pool outside the repo
-    pool_dir = outside_repo_tmp_path / "poolroot"
-    pool_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("HUNTER_POOL_BASE_DIR", str(pool_dir))
-    # connect pool/staging/config for approval credentials
-    pool2 = PoolControl(
-        pool_dir / "staging",
-        pool_dir / "production",
-        read_secret=StaticSecretReader(),
-        probe_runner=FakeProbeRunner(),
-    )
-    pool2.register_provider("acme", base_url="https://acme.ai/v1")
-    pool2.enter_key("acme")
-    # run CLI (wires PoolControl internally with HUNTER_POOL_BASE_DIR)
-    code = cli_main(
-        ["run-stage-two", "--data-dir", str(data_dir)]
-    )
-    out = capsys.readouterr().out
-    summary = json.loads(out)
-    assert code in (0, 1)
-    assert summary["providers_read"] >= 1
-    assert "promoted" in summary
+    server = PoolControlServer(pool, bearer_token="test-control-token")
+    server.start_background()
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", server.url)
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    try:
+        code = cli_main(["run-stage-two", "--data-dir", str(data_dir)])
+        out = capsys.readouterr().out
+        summary = json.loads(out)
+        assert code == 0
+        assert summary["providers_read"] >= 1
+        assert "acme" in summary["promoted"]
+    finally:
+        server.shutdown()
+
+
+def test_run_stage_two_cli_uses_pool_client_only(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", "http://127.0.0.1:8091")
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, url: str, token: str):
+            captured["url"] = url
+            captured["token"] = token
+
+    class FakeRunner:
+        def __init__(self, *, data_dir: Path, pool_control: object):
+            captured["data_dir"] = data_dir
+            captured["pool_control"] = pool_control
+
+        def run(self):
+            return SimpleNamespace(
+                to_dict=lambda: {"skipped_locked": False},
+                skipped_locked=False,
+                suspend_failed=[],
+                pool_runtime_split=[],
+            )
+
+    monkeypatch.setattr("hunter.pool_api.PoolControlClient", FakeClient)
+    monkeypatch.setattr("hunter.runtime.stage2.Stage2Runner", FakeRunner)
+    assert cli_main(["run-stage-two", "--data-dir", str(tmp_path)]) == 0
+    assert captured["url"] == "http://127.0.0.1:8091"
+    assert isinstance(captured["pool_control"], FakeClient)

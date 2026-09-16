@@ -657,6 +657,17 @@ def test_http_api_does_not_expose_remote_resume(tmp_path: Path) -> None:
         server.shutdown()
 
 
+def test_http_api_pool_status_returns_sanitized_provider_ids(tmp_path: Path) -> None:
+    control = _control(tmp_path)
+    _registered_with_key(control)
+    assert control.promote("acme")["promoted"] is True
+    server, client = _serve(control)
+    try:
+        assert client.list_production() == ["acme"]
+    finally:
+        server.shutdown()
+
+
 def test_http_api_rejects_key_material_in_body(tmp_path: Path) -> None:
     import urllib.request
 
