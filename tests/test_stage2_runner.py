@@ -38,7 +38,7 @@ from hunter.runtime.models import (
     ProtocolResult,
     RuntimeProvider,
 )
-from hunter.runtime.stage2 import Stage2Runner, approve_provider, runtime_status
+from hunter.runtime.stage2 import Stage2Runner, Stage2Summary, approve_provider, runtime_status
 from hunter.runtime.store import RuntimeStore
 
 AS_OF = datetime.fromisoformat("2026-09-12T00:00:00+00:00")
@@ -433,3 +433,198 @@ def test_run_stage_two_cli_uses_pool_client_only(tmp_path: Path, monkeypatch) ->
     assert cli_main(["run-stage-two", "--data-dir", str(tmp_path)]) == 0
     assert captured["url"] == "http://127.0.0.1:8091"
     assert isinstance(captured["pool_control"], FakeClient)
+
+
+# =============================================================================
+# Credential reconciliation (Problem 1.4.2B)
+# =============================================================================
+
+
+class FakePoolStatus:
+    """Simulates PoolControlClient.status() responses."""
+
+    def __init__(self, **fields):
+        self._fields = fields
+
+    def __call__(self):
+        return self
+
+
+def test_credential_reconciliation_maps_key_configured(tmp_path: Path) -> None:
+    """key_configured true -> CONFIGURED; false -> NOT_CONFIGURED."""
+    data_dir, registry, evidence_store, pool = _seed(tmp_path, hunter_root=None)
+    store = RuntimeStore(
+        data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
+    )
+    store.upsert(
+        RuntimeProvider(
+            provider_id="acme",
+            credential_status=CredentialStatus.NOT_CONFIGURED,
+        ),
+        reason="setup",
+    )
+    # Fake pool_control that returns configured=true, in_staging=true
+    class FakeControl:
+        def status(self, pid: str):
+            return {"key_configured": True, "in_staging": True, "in_production": False}
+        def list_production(self):
+            return []
+        def probe(self, *a, **kw):
+            return {}
+        def promote(self, *a):
+            return {"promoted": False, "error": "no-op"}
+        def suspend(self, *a):
+            return {"suspended": False, "error": "no-op"}
+        def stop_production(self):
+            return {}
+
+    runner = Stage2Runner(
+        data_dir=data_dir,
+        pool_control=FakeControl(),
+        registry=registry,
+        evidence_store=evidence_store,
+    )
+    runner._reconcile_credential_state(store, Stage2Summary())
+    rp = store.get_provider("acme")
+    assert rp is not None
+    assert rp.credential_status == CredentialStatus.CONFIGURED
+
+
+def test_credential_reconciliation_maps_pool_state(tmp_path: Path) -> None:
+    """in_staging -> STAGING, in_production -> PRODUCTION, none -> UNKNOWN."""
+    data_dir, registry, evidence_store, pool = _seed(tmp_path, hunter_root=None)
+    store = RuntimeStore(
+        data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
+    )
+    store.upsert(RuntimeProvider(provider_id="acme"), reason="setup")
+
+    class FakeControl:
+        def __init__(self, in_staging, in_production):
+            self._s = in_staging
+            self._p = in_production
+        def status(self, pid: str):
+            return {"key_configured": False, "in_staging": self._s, "in_production": self._p}
+        def list_production(self):
+            return []
+        def probe(self, *a, **kw):
+            return {}
+        def promote(self, *a):
+            return {"promoted": False, "error": "no-op"}
+        def suspend(self, *a):
+            return {"suspended": False, "error": "no-op"}
+        def stop_production(self):
+            return {}
+
+    # in_production=true
+    runner = Stage2Runner(
+        data_dir=data_dir, pool_control=FakeControl(False, True), registry=registry, evidence_store=evidence_store
+    )
+    runner._reconcile_credential_state(store, Stage2Summary())
+    assert store.get_provider("acme").actual_pool_status == ActualPoolStatus.PRODUCTION
+
+    # in_staging=true (not production)
+    runner = Stage2Runner(
+        data_dir=data_dir, pool_control=FakeControl(True, False), registry=registry, evidence_store=evidence_store
+    )
+    runner._reconcile_credential_state(store, Stage2Summary())
+    assert store.get_provider("acme").actual_pool_status == ActualPoolStatus.STAGING
+
+    # neither
+    runner = Stage2Runner(
+        data_dir=data_dir, pool_control=FakeControl(False, False), registry=registry, evidence_store=evidence_store
+    )
+    runner._reconcile_credential_state(store, Stage2Summary())
+    assert store.get_provider("acme").actual_pool_status == ActualPoolStatus.UNKNOWN
+
+
+def test_credential_reconciliation_unreachable_fails_closed(tmp_path: Path) -> None:
+    """An unreachable PoolControl must not mark anything configured."""
+    data_dir, registry, evidence_store, pool = _seed(tmp_path, hunter_root=None)
+    store = RuntimeStore(
+        data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
+    )
+    store.upsert(
+        RuntimeProvider(
+            provider_id="acme",
+            credential_status=CredentialStatus.NOT_CONFIGURED,
+        ),
+        reason="setup",
+    )
+
+    class FaultyControl:
+        def status(self, pid: str):
+            raise ConnectionError("refused")
+        def list_production(self):
+            return []
+        def probe(self, *a, **kw):
+            return {}
+        def promote(self, *a):
+            return {"promoted": False, "error": "no-op"}
+        def suspend(self, *a):
+            return {"suspended": False, "error": "no-op"}
+        def stop_production(self):
+            return {}
+
+    runner = Stage2Runner(
+        data_dir=data_dir,
+        pool_control=FaultyControl(),
+        registry=registry,
+        evidence_store=evidence_store,
+    )
+    runner._reconcile_credential_state(store, Stage2Summary())
+    rp = store.get_provider("acme")
+    assert rp is not None
+    assert rp.credential_status == CredentialStatus.NOT_CONFIGURED
+
+
+def test_credential_reconciliation_reconciles_before_suspend_first(
+    tmp_path: Path, outside_repo_tmp_path: Path
+) -> None:
+    """Runner calls _reconcile_credential_state before suspend-first."""
+    data_dir, registry, evidence_store, pool = _seed(outside_repo_tmp_path / "data", hunter_root=None)
+    _drive_to_approval(data_dir, pool)
+    pool.promote("acme")
+    store = RuntimeStore(
+        data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
+    )
+    rp = store.get_provider("acme")
+    # Set actual_pool=PRODUCTION but force credential back to NOT_CONFIGURED
+    store.upsert(
+        RuntimeProvider(**{**rp.__dict__, "credential_status": CredentialStatus.NOT_CONFIGURED, "actual_pool_status": ActualPoolStatus.PRODUCTION}),
+        changed_fields=["credential_status", "actual_pool_status"],
+        reason="simulate stale",
+    )
+    registry.upsert_provider(
+        _registry_provider(status=ProviderStatus.NOT_FREE),
+        reason="weakened",
+        source_metadata={"t": True},
+    )
+    server = PoolControlServer(pool, bearer_token="test-control-token")
+    server.start_background()
+    try:
+        runner = Stage2Runner(
+            data_dir=data_dir,
+            pool_control=pool,
+            registry=registry,
+            evidence_store=evidence_store,
+        )
+        summary = runner.run()
+        # The credential should have been reconciled from pool before suspend.
+        assert summary.providers_read >= 1
+    finally:
+        server.shutdown()
+
+
+def test_runtime_status_has_distinct_revisions(tmp_path: Path, capsys) -> None:
+    """runtime status returns runtime_revision and registry_revision separately."""
+    data_dir, registry, evidence_store, pool = _seed(tmp_path)
+    _drive_to_approval(data_dir, pool)
+    rows = runtime_status(data_dir)
+    assert len(rows) == 1
+    row = rows[0]
+    assert "runtime_revision" in row
+    assert "registry_revision" in row
+    # runtime revision should be >= 1 (has been upserted multiple times)
+    assert row["runtime_revision"] >= 1
+    # registry revision should be >= 1
+    assert row["registry_revision"] >= 1

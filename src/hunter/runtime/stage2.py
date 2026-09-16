@@ -171,6 +171,78 @@ class Stage2Runner:
     def _open_outbox(self) -> OutboxStore:
         return OutboxStore(self.outbox_path)
 
+    # -- credential reconciliation from PoolControl status -----------------
+
+    def _reconcile_credential_state(
+        self, store: RuntimeStore, summary: Stage2Summary
+    ) -> None:
+        """Reconcile Runtime credential_status and actual_pool_status from
+        sanitized PoolControlClient status (never sees keys or paths).
+
+        Called once before suspend-first and again after import so newly
+        imported providers also get reconciled before checks.
+        """
+        for rp in store.list_providers():
+            try:
+                status = self.pool_control.status(rp.provider_id)
+            except Exception:  # noqa: BLE001 - unreachable/malformed fails closed
+                summary.notes.append(
+                    f"credential_reconciliation_unreachable:{rp.provider_id}"
+                )
+                continue
+            if not isinstance(status, dict):
+                summary.notes.append(
+                    f"credential_reconciliation_invalid_status:{rp.provider_id}"
+                )
+                continue
+
+            # Map key_configured -> credential_status
+            key_configured = bool(status.get("key_configured", False))
+            new_credential = (
+                CredentialStatus.CONFIGURED if key_configured
+                else CredentialStatus.NOT_CONFIGURED
+            )
+
+            # Map in_staging/in_production -> actual_pool_status
+            in_staging = bool(status.get("in_staging", False))
+            in_production = bool(status.get("in_production", False))
+            if in_production:
+                new_actual = ActualPoolStatus.PRODUCTION
+            elif in_staging:
+                new_actual = ActualPoolStatus.STAGING
+            else:
+                new_actual = ActualPoolStatus.UNKNOWN
+
+            # Build an updated provider if anything changed
+            changed = []
+            if rp.credential_status != new_credential:
+                changed.append("credential_status")
+            if rp.actual_pool_status != new_actual:
+                changed.append("actual_pool_status")
+            if not changed:
+                continue
+
+            updated = RuntimeProvider(
+                provider_id=rp.provider_id,
+                provider_name=rp.provider_name,
+                evidence_status=rp.evidence_status,
+                credential_status=new_credential,
+                health_status=rp.health_status,
+                health_checked_at=rp.health_checked_at,
+                protocol_result=rp.protocol_result,
+                expected_pool_status=rp.expected_pool_status,
+                actual_pool_status=new_actual,
+                approval_status=rp.approval_status,
+                approval_binding=rp.approval_binding,
+                last_synced_at=rp.last_synced_at,
+                notified_events=list(rp.notified_events),
+            )
+            store.upsert(
+                updated,
+                changed_fields=changed,
+                reason="credential_reconciliation",
+            )
+
     # -- the run -----------------------------------------------------------
 
     def run(self) -> Stage2Summary:
@@ -193,6 +265,9 @@ class Stage2Runner:
             providers = store.list_providers()
             summary.providers_read = len(providers)
 
+            # (2b) reconcile credential and pool state from Pool Control
+            self._reconcile_credential_state(store, summary)
+
             # (3)+(4) reconcile registry, suspend invalid FIRST
             self._suspend_invalid_first(store, providers, summary)
 
@@ -201,6 +276,9 @@ class Stage2Runner:
 
             # (6) import new FREE_CONFIRMED providers
             self._import_new_confirmed(store, summary)
+
+            # (6b) reconcile newly imported providers once more before checks
+            self._reconcile_credential_state(store, summary)
 
             # (7) deliver outbox notifications (idempotent consumer)
             summary.notifications_delivered = self._deliver_notifications()
@@ -420,12 +498,20 @@ def approve_provider(
 
 
 def runtime_status(data_dir: Path) -> List[Dict[str, Any]]:
-    """`hunter runtime status` worker: sanitized runtime provider listing."""
+    """`hunter runtime status` worker: sanitized runtime provider listing.
+
+    Returns distinct runtime_revision (from RuntimeStore) and
+    registry_revision (from ProviderRegistry) as separate fields.
+    """
+    registry = ProviderRegistry(
+        data_dir / "providers.json", data_dir / "history.jsonl"
+    )
     store = RuntimeStore(
         data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
     )
     rows: List[Dict[str, Any]] = []
     for rp in store.list_providers():
+        registry_provider = registry.get_provider(rp.provider_id)
         rows.append(
             {
                 "provider_id": rp.provider_id,
@@ -437,7 +523,8 @@ def runtime_status(data_dir: Path) -> List[Dict[str, Any]]:
                 "expected_pool_status": rp.expected_pool_status.value,
                 "actual_pool_status": rp.actual_pool_status.value,
                 "approval_status": rp.approval_status.value,
-                "revision": rp.revision,
+                "runtime_revision": rp.revision,
+                "registry_revision": registry_provider.revision if registry_provider else None,
             }
         )
     return rows
