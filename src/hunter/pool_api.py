@@ -24,8 +24,12 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import secrets
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
@@ -44,6 +48,40 @@ _FORBIDDEN_BODY_KEYS = {
 
 class PoolApiError(Exception):
     """Structured client-side error; never carries secrets."""
+
+
+def _validate_loopback_base_url(base_url: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise PoolApiError("loopback_base_url_required") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or port is None
+        or not 1 <= port <= 65535
+    ):
+        raise PoolApiError("loopback_base_url_required")
+    return f"http://127.0.0.1:{port}"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Any:
+        raise PoolApiError("redirect_refused")
 
 
 def _sanitize(payload: Any) -> Any:
@@ -86,7 +124,7 @@ class PoolControlHandler(BaseHTTPRequestHandler):
         supplied = header[len("Bearer "):].strip()
         if not supplied or not self.bearer_token:
             return False
-        return supplied == self.bearer_token
+        return secrets.compare_digest(supplied, self.bearer_token)
 
     def _deny(self, status: int, code: str) -> None:
         body = json.dumps({"error": code}).encode("utf-8")
@@ -197,6 +235,8 @@ class PoolControlServer:
     ):
         if not bearer_token:
             raise PoolApiError("bearer_token_required")
+        if host != "127.0.0.1":
+            raise PoolApiError("loopback_host_required")
         self.pool_control = pool_control
         self.bearer_token = bearer_token
 
@@ -251,14 +291,14 @@ class PoolControlClient:
     def __init__(self, base_url: str, bearer_token: str, timeout: float = 30.0):
         if not bearer_token:
             raise PoolApiError("bearer_token_required")
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _validate_loopback_base_url(base_url)
         self.bearer_token = bearer_token
         self.timeout = timeout
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirectHandler()
+        )
 
     def _request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        import urllib.error
-        import urllib.request
-
         url = f"{self.base_url}{path}"
         data = None
         headers = {"Authorization": f"Bearer {self.bearer_token}"}
@@ -270,7 +310,7 @@ class PoolControlClient:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             try:

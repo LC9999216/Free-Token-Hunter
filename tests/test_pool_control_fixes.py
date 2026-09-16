@@ -18,6 +18,7 @@ from __future__ import annotations
 import http.client
 import json
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -449,6 +450,132 @@ def test_server_start_background_waits_until_ready(tmp_path: Path) -> None:
             server.shutdown()
         else:
             server._httpd.server_close()
+
+
+class CaptureFixture:
+    def __init__(self) -> None:
+        fixture = self
+        self.seen_authorization: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                fixture.seen_authorization.append(
+                    self.headers.get("Authorization", "")
+                )
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread: threading.Thread | None = None
+
+    @property
+    def base_url(self) -> str:
+        host, port = self.server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class RedirectFixture:
+    def __init__(self, location: str) -> None:
+        fixture = self
+        self.location = location
+        self.seen_authorization: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                fixture.seen_authorization.append(
+                    self.headers.get("Authorization", "")
+                )
+                self.send_response(302)
+                self.send_header("Location", fixture.location)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread: threading.Thread | None = None
+
+    @property
+    def base_url(self) -> str:
+        host, port = self.server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "localhost", "127.0.0.2"])
+def test_http_server_rejects_noncanonical_loopback(tmp_path: Path, host: str) -> None:
+    control = _control(tmp_path)
+    server = None
+    try:
+        with pytest.raises(PoolApiError, match="loopback_host_required"):
+            server = PoolControlServer(control, bearer_token="test-bearer-token", host=host)
+    finally:
+        if server is not None:
+            server._httpd.server_close()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://127.0.0.1:9000",
+        "http://localhost:9000",
+        "http://127.0.0.2:9000",
+        "http://user@127.0.0.1:9000",
+        "http://127.0.0.1:9000/path",
+        "http://example.com:9000",
+    ],
+)
+def test_pool_client_rejects_noncanonical_base_url(url: str) -> None:
+    with pytest.raises(PoolApiError, match="loopback_base_url_required"):
+        PoolControlClient(url, "test-bearer-token")
+
+
+def test_pool_client_refuses_redirect_before_forwarding_token() -> None:
+    sink = CaptureFixture()
+    sink.start()
+    redirect = RedirectFixture(location=f"{sink.base_url}/capture")
+    redirect.start()
+    try:
+        client = PoolControlClient(redirect.base_url, "test-bearer-token")
+        with pytest.raises(PoolApiError, match="redirect_refused"):
+            client.status("acme")
+        assert redirect.seen_authorization == ["Bearer test-bearer-token"]
+        assert sink.seen_authorization == []
+    finally:
+        redirect.stop()
+        sink.stop()
+
+
+def test_pool_client_ignores_system_proxy(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    server = PoolControlServer(_control(tmp_path), bearer_token="test-bearer-token")
+    try:
+        server.start_background()
+        client = PoolControlClient(server.url, "test-bearer-token")
+        assert client.status("missing")["provider_id"] == "missing"
+    finally:
+        server.shutdown()
 
 
 def test_http_api_rejects_missing_or_wrong_token(tmp_path: Path) -> None:
