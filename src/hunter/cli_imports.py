@@ -59,6 +59,54 @@ def _handle_pool_approve(args) -> int:  # noqa: ANN001
     return 0 if result.get("ok") else 1
 
 
+def _handle_pool_control_status(args) -> int:  # noqa: ANN001
+    """Sanitized pool/service status via PoolControlClient (no keys)."""
+    import json
+
+    from .pool_api import PoolControlClient
+
+    base_url = os.environ.get("HUNTER_POOL_CONTROL_URL", "")
+    token = os.environ.get("HUNTER_POOL_CONTROL_TOKEN", "")
+    if not base_url or not token:
+        raise RuntimeError("pool control URL and token are required")
+    pc = PoolControlClient(base_url, token)
+    status = pc.pool_status()
+    print(json.dumps(status, indent=2))
+    return 0
+
+
+def _handle_pool_suspend(args) -> int:  # noqa: ANN001
+    """Suspend a provider from the production pool via PoolControlClient."""
+    import json
+
+    from .pool_api import PoolControlClient
+
+    base_url = os.environ.get("HUNTER_POOL_CONTROL_URL", "")
+    token = os.environ.get("HUNTER_POOL_CONTROL_TOKEN", "")
+    if not base_url or not token:
+        raise RuntimeError("pool control URL and token are required")
+    pc = PoolControlClient(base_url, token)
+    result = pc.suspend(args.provider_id)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("suspended") else 1
+
+
+def _handle_pool_stop(args) -> int:  # noqa: ANN001
+    """Halt production containment via PoolControlClient."""
+    import json
+
+    from .pool_api import PoolControlClient
+
+    base_url = os.environ.get("HUNTER_POOL_CONTROL_URL", "")
+    token = os.environ.get("HUNTER_POOL_CONTROL_TOKEN", "")
+    if not base_url or not token:
+        raise RuntimeError("pool control URL and token are required")
+    pc = PoolControlClient(base_url, token)
+    result = pc.stop_production()
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def _handle_runtime_status(args) -> int:  # noqa: ANN001
     import json
 
@@ -90,23 +138,52 @@ def register_stage_two_parsers(subparsers) -> None:  # noqa: ANN001
     approve.add_argument("--approved-by", default="user")
     approve.add_argument("--data-dir", default=None, help="data directory")
     approve.set_defaults(handler=_handle_pool_approve)
+
+    control_status = pool_sub.add_parser(
+        "control-status",
+        help="show sanitized pool/service state (no keys, no full upstream responses)",
+    )
+    control_status.add_argument("--data-dir", default=None, help="data directory")
+    control_status.set_defaults(handler=_handle_pool_control_status)
+
+    suspend_pool = pool_sub.add_parser(
+        "suspend",
+        help="suspend a provider from the production pool (requires --confirm)",
+    )
+    suspend_pool.add_argument("--provider-id", required=True)
+    suspend_pool.add_argument("--confirm", required=True, help="literal SUSPEND")
+    suspend_pool.add_argument("--data-dir", default=None, help="data directory")
+    suspend_pool.set_defaults(handler=_handle_pool_suspend)
+
+    stop_pool = pool_sub.add_parser(
+        "stop",
+        help="halt the production pool (requires --confirm STOP)",
+    )
+    stop_pool.add_argument("--confirm", required=True, help="literal STOP")
+    stop_pool.add_argument("--data-dir", default=None, help="data directory")
+    stop_pool.set_defaults(handler=_handle_pool_stop)
+
     pool.set_defaults(handler=_pool_usage)
 
     runtime = subparsers.add_parser("runtime", help="runtime store operations")
     runtime_sub = runtime.add_subparsers(dest="runtime_command", metavar="ACTION")
-    status = runtime_sub.add_parser("status", help="list runtime providers (sanitized)")
+    status = runtime_sub.add_parser("status", help="list runtime providers (sanitized; distinct revisions)")
     status.add_argument("--data-dir", default=None, help="data directory")
     status.set_defaults(handler=_handle_runtime_status)
     runtime.set_defaults(handler=_runtime_usage)
 
 
 def _pool_usage(args) -> int:  # noqa: ANN001, ARG001
-    print("usage: hunter pool approve --provider-id ID --expected-revision N")
+    print("usage: hunter pool approve|control-status|suspend|stop ...")
+    print("  hunter pool approve     --provider-id ID --expected-revision N")
+    print("  hunter pool control-status")
+    print("  hunter pool suspend     --provider-id ID --confirm SUSPEND")
+    print("  hunter pool stop        --confirm STOP")
     return 2
 
 
 def _runtime_usage(args) -> int:  # noqa: ANN001, ARG001
-    print("usage: hunter runtime status")
+    print("usage: hunter runtime status [--data-dir DIR]")
     return 2
 
 

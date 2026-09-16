@@ -628,3 +628,80 @@ def test_runtime_status_has_distinct_revisions(tmp_path: Path, capsys) -> None:
     assert row["runtime_revision"] >= 1
     # registry revision should be >= 1
     assert row["registry_revision"] >= 1
+
+
+# =============================================================================
+# Safe operator commands (Problem 1.4.2C)
+# =============================================================================
+
+
+def test_cli_pool_control_status_offline(tmp_path: Path, capsys, monkeypatch) -> None:
+    """hunter pool control-status returns sanitized pool state."""
+    data_dir, _, _, pool = _seed(tmp_path, hunter_root=None)
+    from hunter.pool_api import PoolControlServer
+    server = PoolControlServer(pool, bearer_token="test-control-token")
+    server.start_background()
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", server.url)
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    try:
+        code = cli_main(["pool", "control-status"])
+        out = capsys.readouterr().out
+        assert code == 0
+        import json
+        parsed = json.loads(out)
+        assert "production_ids" in parsed
+        assert "production_halted" in parsed
+        assert "sk-" not in out
+    finally:
+        server.shutdown()
+
+
+def test_cli_pool_suspend_via_client(tmp_path: Path, capsys, monkeypatch) -> None:
+    """hunter pool suspend calls PoolControlClient.suspend()."""
+    data_dir, _, _, pool = _seed(tmp_path, hunter_root=None)
+    from hunter.pool_api import PoolControlServer
+    server = PoolControlServer(pool, bearer_token="test-control-token")
+    server.start_background()
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", server.url)
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    try:
+        code = cli_main(["pool", "suspend", "--provider-id", "ghost", "--confirm", "SUSPEND"])
+        out = capsys.readouterr().out
+        # ghost is not in production, so suspend is idempotent (returns suspended=true)
+        assert code == 0
+        assert "sk-" not in out
+    finally:
+        server.shutdown()
+
+
+def test_cli_pool_stop_via_client(tmp_path: Path, capsys, monkeypatch) -> None:
+    """hunter pool stop calls PoolControlClient.stop_production()."""
+    data_dir, _, _, pool = _seed(tmp_path, hunter_root=None)
+    from hunter.pool_api import PoolControlServer
+    server = PoolControlServer(pool, bearer_token="test-control-token")
+    server.start_background()
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", server.url)
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    try:
+        code = cli_main(["pool", "stop", "--confirm", "STOP"])
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "halted" in out or "true" in out
+        assert "sk-" not in out
+    finally:
+        server.shutdown()
+
+
+def test_cli_pool_control_status_requires_connection(tmp_path: Path) -> None:
+    """control-status fails closed without pool control env vars."""
+    with pytest.raises(RuntimeError, match="pool control URL and token are required"):
+        cli_main(["pool", "control-status", "--data-dir", str(tmp_path)])
+
+
+def test_cli_pool_suspend_refuses_without_confirm(tmp_path: Path) -> None:
+    """hunter pool suspend requires --confirm SUSPEND."""
+    import sys
+    from hunter.cli import main as cli_entry
+    # argparse exits on missing required argument, so catch sys.exit
+    with pytest.raises((SystemExit, RuntimeError)):
+        cli_main(["pool", "suspend", "--provider-id", "acme"])
