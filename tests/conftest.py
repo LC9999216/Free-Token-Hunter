@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -32,6 +33,16 @@ def tmp_path():
     path.mkdir()
     yield path
     shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture()
+def outside_repo_tmp_path():
+    """Temporary directory outside the repository for boundary tests."""
+    path = Path(tempfile.mkdtemp(prefix="hunter-pool-test-"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")

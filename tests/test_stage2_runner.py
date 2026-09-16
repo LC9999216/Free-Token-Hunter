@@ -377,14 +377,19 @@ def test_cli_pool_approve_rejects_wrong_revision(tmp_path: Path, capsys) -> None
     assert "registry_revision_mismatch" in out
 
 
-def test_cli_run_stage_two_offline(tmp_path: Path, capsys, monkeypatch) -> None:
+def test_cli_run_stage_two_offline(
+    tmp_path: Path,
+    outside_repo_tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
     """Full CLI e2e: approved provider gets promoted through run-stage-two."""
-    outside_repo = Path(__file__).resolve().parents[2].parent / "dsh-tmp-test" / tmp_path.name
-    outside_repo.mkdir(parents=True, exist_ok=True)
-    data_dir, registry, evidence_store, pool = _seed(outside_repo / "data", hunter_root=None)
+    data_dir, registry, evidence_store, pool = _seed(
+        outside_repo_tmp_path / "data", hunter_root=None
+    )
     _drive_to_approval(data_dir, pool)
     # point the CLI at a pool outside the repo
-    pool_dir = outside_repo / "poolroot"
+    pool_dir = outside_repo_tmp_path / "poolroot"
     pool_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HUNTER_POOL_BASE_DIR", str(pool_dir))
     # connect pool/staging/config for approval credentials

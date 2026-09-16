@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 from pathlib import Path
@@ -420,10 +421,34 @@ def test_suspend_write_failure_returns_false(tmp_path: Path) -> None:
 
 def _serve(control: PoolControl) -> tuple[PoolControlServer, PoolControlClient]:
     server = PoolControlServer(control, bearer_token="test-bearer-token")
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    server.start_background()
     client = PoolControlClient(server.url, "test-bearer-token")
     return server, client
+
+
+def test_server_start_background_waits_until_ready(tmp_path: Path) -> None:
+    control = _control(tmp_path)
+    server = PoolControlServer(control, bearer_token="test-bearer-token")
+    try:
+        thread = server.start_background(timeout=2.0)
+        assert thread.is_alive()
+        connection = http.client.HTTPConnection(server.host, server.port, timeout=1.0)
+        try:
+            connection.request(
+                "GET",
+                "/providers/missing/status",
+                headers={"Authorization": "Bearer test-bearer-token"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            assert json.loads(response.read())["provider_id"] == "missing"
+        finally:
+            connection.close()
+    finally:
+        if getattr(server, "_thread", None) is not None:
+            server.shutdown()
+        else:
+            server._httpd.server_close()
 
 
 def test_http_api_rejects_missing_or_wrong_token(tmp_path: Path) -> None:

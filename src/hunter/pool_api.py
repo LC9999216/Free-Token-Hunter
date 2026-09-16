@@ -21,8 +21,11 @@ Guarantees:
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
@@ -204,6 +207,7 @@ class PoolControlServer:
         )
         self._httpd = ThreadingHTTPServer((host, port), handler_class)
         self.host, self.port = self._httpd.server_address[:2]
+        self._thread: Optional[threading.Thread] = None
 
     @property
     def url(self) -> str:
@@ -211,6 +215,30 @@ class PoolControlServer:
 
     def serve_forever(self) -> None:
         self._httpd.serve_forever()
+
+    def start_background(self, timeout: float = 2.0) -> threading.Thread:
+        if self._thread is not None:
+            raise PoolApiError("server_already_started")
+        thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            name="hunter-pool-control",
+            daemon=True,
+        )
+        self._thread = thread
+        thread.start()
+        deadline = time.monotonic() + max(0.01, timeout)
+        while time.monotonic() < deadline:
+            connection = http.client.HTTPConnection(self.host, self.port, timeout=0.1)
+            try:
+                connection.request("GET", "/")
+                if connection.getresponse().status == 401:
+                    return thread
+            except OSError:
+                pass
+            finally:
+                connection.close()
+            thread.join(timeout=0.01)
+        raise PoolApiError("server_start_timeout")
 
     def shutdown(self) -> None:
         self._httpd.shutdown()
