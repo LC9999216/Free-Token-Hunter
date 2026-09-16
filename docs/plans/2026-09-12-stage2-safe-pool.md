@@ -228,10 +228,12 @@ Hunter
 
 Pool Control
   GET  /providers/{id}/status
+  GET  /pool/status                 # sanitized loaded provider IDs only
   POST /providers/{id}/probe
   POST /providers/{id}/promote
   POST /providers/{id}/suspend
-  仅 127.0.0.1，独立 Bearer（HUNTER_POOL_CONTROL_TOKEN）
+  仅精确绑定 127.0.0.1，独立 Bearer（HUNTER_POOL_CONTROL_TOKEN）；
+  拒绝重定向和系统代理
   响应不得包含 Key、请求头、环境变量、完整上游响应
 
 staging FreeLLMPool
@@ -241,7 +243,8 @@ staging FreeLLMPool
 
 production FreeLLMPool
   独立目录
-  `freellmpool proxy --host 127.0.0.1 --port 8080`
+  由 Pool Control 服务进程以公开 `freellmpool.proxy.serve` API 创建、
+  reload、halt 和读取已加载 Provider
   仅已批准 Provider
 ```
 
@@ -252,6 +255,17 @@ production FreeLLMPool
 Promotion = 把 staging 中已批准 Provider 的**配置副本**写入 production 目录（Key 仍只在 Pool Control 边界内复制），然后校验 production 实际状态。Hunter 只看到 `promoted=true` 或错误码。
 
 若复制/热加载无法在不暴露 Key 的前提下完成：停止，报告 blocker，不降级。
+
+### 6.3 Hardened service boundary
+
+- Hunter 只通过 `PoolControlClient` 调用回环控制 API；它不接收 staging /
+  production 路径，也不读取 Pool TOML。
+- Pool Control 服务持有并重载 production FreeLLMPool proxy。配置文件回读是
+  必要条件；`/pool/status` 返回的 live loaded-provider readback 才是运行态
+  对账依据。
+- containment halt 在 proxy 停止前原子持久化。HTTP API 无远程 resume；只有
+  停止服务后运行 `hunter-pool-control resume --confirm RESUME` 才能清除 latch。
+- 控制 API 只接受 `127.0.0.1`，拒绝重定向和环境代理，且不会返回 Provider Key。
 
 ---
 

@@ -131,12 +131,12 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -c "import freellmpool; assert freellmpool.__version__ == '0.13.0'"
 ```
 
-Set the named environment variables in the relevant local process environments
-without recording their values: `HUNTER_POOL_CONTROL_TOKEN`,
-`HUNTER_POOL_CONTROL_URL`, and `FREELLMPOOL_PROXY_KEY`.
+1. Set the named environment variables in the relevant local process
+   environments without recording their values: `HUNTER_POOL_CONTROL_TOKEN`,
+   `HUNTER_POOL_CONTROL_URL`, and `FREELLMPOOL_PROXY_KEY`.
+2. Start `hunter-pool-control serve` in the isolated Pool Control environment.
+3. Run `python -m hunter run-stage-two` in the Hunter environment.
+4. Treat every nonzero exit code as fail-closed and review it before retrying.
 
-Start `hunter-pool-control serve` in the isolated Pool Control environment,
-then run `python -m hunter run-stage-two` in the Hunter environment. The
-Pool Control service owns the provider TOML files, provider keys, and
-FreeLLMPool proxy. A nonzero exit code is fail-closed and requires operator
-review before retrying.
+The Pool Control service owns the provider TOML files, provider keys, and
+FreeLLMPool proxy; Hunter communicates through `PoolControlClient` only.
