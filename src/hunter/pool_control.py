@@ -415,6 +415,37 @@ class PoolControl:
         logger.info("key configured for %s (value never logged)", provider_id)
         return {"provider_id": provider_id, "configured": True}
 
+    def remove_provider(self, provider_id: str) -> Dict[str, Any]:
+        """Remove a provider definition and its key from staging only.
+        
+        Refuses if the provider is currently in production.
+        Removal is idempotent: removing a non-existent provider succeeds.
+        """
+        if any(p.get("id") == provider_id for p in self._production_providers()):
+            return {
+                "provider_id": provider_id,
+                "removed": False,
+                "error": "in_production",
+            }
+        providers = [p for p in self._staging_providers() if p.get("id") != provider_id]
+        keys = self._staging_keys()
+        removed_key = False
+        record = next(
+            (p for p in self._staging_providers() if p.get("id") == provider_id), None
+        )
+        if record is not None:
+            key_env = str(record.get("key_env") or "")
+            if key_env in keys:
+                del keys[key_env]
+                removed_key = True
+        self._write_staging(providers, keys)
+        logger.info("removed provider %s from staging", provider_id)
+        return {
+            "provider_id": provider_id,
+            "removed": True,
+            "key_removed": removed_key,
+        }
+
     def _is_configured(self, provider_id: str) -> bool:
         record = next(
             (p for p in self._staging_providers() if p.get("id") == provider_id), None
