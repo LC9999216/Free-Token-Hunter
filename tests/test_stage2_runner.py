@@ -771,3 +771,43 @@ def test_run_stage_two_wires_feishu_adapter(monkeypatch, tmp_path) -> None:
     assert code == 0
     assert captured_runner["kwargs"]["notification_adapter"] is not None
     assert "Webhook" in type(captured_runner["kwargs"]["notification_adapter"]).__name__
+
+
+# =============================================================================
+# Client-config CLI command (Problem 1.4.2E)
+# =============================================================================
+
+
+def test_cli_client_config_write_offline(tmp_path: Path, capsys) -> None:
+    """hunter client-config write generates files from runtime state."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    from hunter.runtime.store import RuntimeStore
+    store = RuntimeStore(data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl")
+    store.upsert(
+        RuntimeProvider(
+            provider_id="acme",
+            provider_name="Acme AI",
+            evidence_status="FREE_CONFIRMED",
+            credential_status=CredentialStatus.CONFIGURED,
+            health_status=HealthStatus.HEALTHY,
+            protocol_result=ProtocolResult(chat="pass", responses="pass", streaming="pass", tools="pass"),
+            expected_pool_status=ExpectedPoolStatus.PRODUCTION,
+            actual_pool_status=ActualPoolStatus.PRODUCTION,
+            approval_status=ApprovalStatus.APPROVED,
+        ),
+        reason="setup",
+    )
+    output_dir = tmp_path / "clients"
+    code = cli_main([
+        "client-config", "write",
+        "--data-dir", str(data_dir),
+        "--output-dir", str(output_dir),
+    ])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert (output_dir / "codex-providers.toml").is_file()
+    assert (output_dir / "opencode.json").is_file()
+    assert (output_dir / "agent-providers.yaml").is_file()
+    assert "sk-" not in out
+    assert "Bearer " not in out

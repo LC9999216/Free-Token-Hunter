@@ -417,7 +417,7 @@ class PoolControl:
 
     def remove_provider(self, provider_id: str) -> Dict[str, Any]:
         """Remove a provider definition and its key from staging only.
-        
+
         Refuses if the provider is currently in production.
         Removal is idempotent: removing a non-existent provider succeeds.
         """

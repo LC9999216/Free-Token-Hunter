@@ -129,8 +129,38 @@ def _handle_runtime_status(args) -> int:  # noqa: ANN001
     return 0
 
 
+def _handle_client_config_write(args) -> int:  # noqa: ANN001
+    """Generate client configs from readback-confirmed production providers."""
+    import json
+    from pathlib import Path
+
+    from .client_config import write_client_configs
+    from .pool_api import PoolControlClient
+    from .runtime.store import RuntimeStore
+
+    data_dir = _resolve_data_dir(args)
+    output_dir = Path(args.output_dir) if args.output_dir else data_dir / "clients"
+
+    # Read runtime providers
+    store = RuntimeStore(data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl")
+    providers = store.list_providers()
+
+    # Optional Pool Control readback for confirmed production IDs
+    confirmed_production_ids = None
+    base_url = os.environ.get("HUNTER_POOL_CONTROL_URL", "")
+    token = os.environ.get("HUNTER_POOL_CONTROL_TOKEN", "")
+    if base_url and token:
+        pc = PoolControlClient(base_url, token)
+        confirmed_production_ids = pc.list_production()
+
+    outputs = write_client_configs(output_dir, providers, confirmed_production_ids)
+    summary = {k: str(v) for k, v in outputs.items()}
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def _handle_notifications_drain(args) -> int:  # noqa: ANN001
-    """Drain the notification outbox using an optional Feishu webhook."""
+    """Drain the notification outbox."""
     import json
 
     from .runtime.outbox import OutboxStore
@@ -203,6 +233,20 @@ def register_stage_two_parsers(subparsers) -> None:  # noqa: ANN001
     status.set_defaults(handler=_handle_runtime_status)
     runtime.set_defaults(handler=_runtime_usage)
 
+    client_config = subparsers.add_parser(
+        "client-config",
+        help="generate client configuration files for Codex, OpenCode, and generic agents",
+    )
+    client_config_sub = client_config.add_subparsers(dest="client_config_command", metavar="ACTION")
+    write = client_config_sub.add_parser(
+        "write",
+        help="write client configs from runtime state + pool readback",
+    )
+    write.add_argument("--output-dir", default=None, help="output directory (default: data_dir/clients)")
+    write.add_argument("--data-dir", default=None, help="data directory")
+    write.set_defaults(handler=_handle_client_config_write)
+    client_config.set_defaults(handler=_client_config_usage)
+
     notifications = subparsers.add_parser("notifications", help="notification outbox operations")
     notifications_sub = notifications.add_subparsers(dest="notifications_command", metavar="ACTION")
     drain = notifications_sub.add_parser(
@@ -230,6 +274,11 @@ def _runtime_usage(args) -> int:  # noqa: ANN001, ARG001
 
 def _notifications_usage(args) -> int:  # noqa: ANN001, ARG001
     print("usage: hunter notifications drain [--data-dir DIR]")
+    return 2
+
+
+def _client_config_usage(args) -> int:  # noqa: ANN001, ARG001
+    print("usage: hunter client-config write [--output-dir DIR] [--data-dir DIR]")
     return 2
 
 
