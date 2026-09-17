@@ -130,6 +130,30 @@ def test_replacement_failure_rolls_back_entire_set(tmp_path, monkeypatch, existi
         assert all((tmp_path / n).read_text() == "old" for n in names)
 
 
+def test_rollback_failure_preserves_backup_and_restores_other_files(tmp_path, monkeypatch):
+    names = ("codex-providers.toml", "opencode.json", "agent-providers.yaml")
+    for name in names:
+        (tmp_path / name).write_text("old-" + name)
+    original = os.replace
+    calls = 0
+
+    def failing_replace(src, dst):
+        nonlocal calls
+        calls += 1
+        if calls in (3, 4):
+            raise OSError("fixture replacement and rollback failure")
+        return original(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError):
+        cc.write_client_configs(tmp_path, runtime(), catalog())
+    assert (tmp_path / names[0]).read_text() == "old-" + names[0]
+    assert (tmp_path / names[2]).read_text() == "old-" + names[2]
+    backups = list(tmp_path.glob(".opencode.json-*.tmp"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == "old-opencode.json"
+
+
 def test_control_catalog_refuses_disk_only_and_halted(tmp_path):
     pc = PoolControl(tmp_path / "staging", tmp_path / "production")
     with pytest.raises(PoolControlError):

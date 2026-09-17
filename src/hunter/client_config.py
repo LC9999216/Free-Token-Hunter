@@ -206,6 +206,7 @@ def write_client_configs(directory: Path, runtime_providers: Sequence[RuntimePro
     staged: dict[str, Path] = {}
     backups: dict[str, Path] = {}
     replaced = []
+    preserve: set[Path] = set()
     try:
         for name, path in outputs.items():
             staged[name] = _stage_file(directory, path.name, contents[name].encode("utf-8"))
@@ -216,13 +217,23 @@ def write_client_configs(directory: Path, runtime_providers: Sequence[RuntimePro
                 os.replace(staged[name], path)
                 replaced.append(name)
         except OSError:
+            rollback_failed = False
             for name in reversed(replaced):
-                if name in backups:
-                    os.replace(backups[name], outputs[name])
-                else:
-                    outputs[name].unlink()
+                try:
+                    if name in backups:
+                        os.replace(backups[name], outputs[name])
+                    else:
+                        outputs[name].unlink()
+                except OSError:
+                    rollback_failed = True
+                    if name in backups:
+                        preserve.add(backups[name])
+                    # Restore remaining independent files despite this failure.
+            if rollback_failed:
+                raise OSError("client_config_rollback_failed_backups_preserved") from None
             raise
     finally:
         for path in (*staged.values(), *backups.values()):
-            path.unlink(missing_ok=True)
+            if path not in preserve:
+                path.unlink(missing_ok=True)
     return outputs
