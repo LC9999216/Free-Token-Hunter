@@ -38,23 +38,18 @@ class FeishuAdapter:
 
 
 def build_feishu_payload(message: OutboxMessage) -> dict:
-    """Build the delivery payload from STRUCTURED PUBLIC FIELDS ONLY.
+    """Build a Feishu custom-bot text payload.
 
-    No exception text, no reasons, no keys, no Authorization content ever
-    enters a payload (review 六.7).
+    Only the documented request fields (msg_type/content) are emitted;
+    structured context goes into the text itself. No exception text, no
+    reasons, no keys, no Authorization content ever enters a payload.
     """
-    text = f"[{message.event_type}] {message.title}\n{message.body}"
+    text = f"[{message.event_type}] {message.provider_id}: {message.title}\n{message.body}"
     return {
         "msg_type": "text",
         "content": {
             "text": text[:2000],
         },
-        # structured metadata for dedup/routing on the receiver side
-        "event_id": message.event_id,
-        "provider_id": message.provider_id,
-        "provider_name": message.provider_name,
-        "event_type": message.event_type,
-        "high_priority": message.high_priority,
     }
 
 
@@ -95,11 +90,7 @@ class WebhookFeishuAdapter(FeishuAdapter):
         except json.JSONDecodeError:
             raise NotificationError("feishu_app_error") from None
         code = decoded.get("code") if isinstance(decoded, dict) else None
-        if code is None and isinstance(decoded, dict) and decoded.get("msg") == "success":
-            # Legacy responses expose StatusCode/StatusMessage only.
-            legacy = decoded.get("StatusCode", 0)
-            code = 0 if legacy in (0, "0", None) else legacy
-        if code != 0:
+        if type(code) is not int or code != 0:
             raise NotificationError("feishu_app_error")
 
 

@@ -52,9 +52,11 @@ def test_unknown_event_type_rejected(tmp_path: Path) -> None:
 def test_feishu_payload_built_from_structured_fields_only() -> None:
     msg = _msg()
     payload = build_feishu_payload(msg)
-    assert payload["provider_id"] == "acme"
-    assert payload["event_type"] == "POOL_SUSPENDED"
-    assert "text" in payload or "content" in payload
+    # Documented request fields only; context is embedded in the text body.
+    assert set(payload) == {"msg_type", "content"}
+    assert payload["msg_type"] == "text"
+    assert msg.event_type in payload["content"]["text"]
+    assert msg.provider_id in payload["content"]["text"]
 
 
 # --- consumer: retry + idempotency --------------------------------------------

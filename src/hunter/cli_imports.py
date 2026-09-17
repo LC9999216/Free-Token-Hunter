@@ -202,11 +202,15 @@ def _handle_notifications_drain(args) -> int:  # noqa: ANN001
         return 2
 
     from .runtime.notify import WebhookFeishuAdapter
-    from .runtime.outbox import OutboxStore
+
+    try:
+        adapter = WebhookFeishuAdapter(webhook_url)
+    except NotificationError as exc:
+        print(json.dumps({"error": exc.code, "sent": [], "failed": [], "skipped_retry": []}))
+        return 2
 
     outbox = OutboxStore(data_dir / "notification_outbox.json")
     try:
-        adapter = WebhookFeishuAdapter(webhook_url)
         consumer = OutboxConsumer(outbox, adapter)
         result = consumer.process_once()
     finally:
@@ -300,7 +304,7 @@ def register_stage_two_parsers(subparsers) -> None:  # noqa: ANN001
     notifications_sub = notifications.add_subparsers(dest="notifications_command", metavar="ACTION")
     drain = notifications_sub.add_parser(
         "drain",
-        help="clear all pending outbox notifications (idempotent, mark-sent)",
+        help="deliver pending notifications; mark sent only after adapter acknowledgement",
     )
     drain.add_argument("--data-dir", default=None, help="data directory")
     drain.set_defaults(handler=_handle_notifications_drain)
