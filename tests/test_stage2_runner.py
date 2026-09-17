@@ -616,6 +616,108 @@ def test_credential_reconciliation_reconciles_before_suspend_first(
         server.shutdown()
 
 
+def test_suspend_first_uses_reconciled_pool_state_same_round(
+    tmp_path: Path, outside_repo_tmp_path: Path
+) -> None:
+    """A provider the Pool reports as live PRODUCTION is suspended in the SAME
+    run, even when the persisted Runtime snapshot still says UNKNOWN.
+
+    Regression: _suspend_invalid_first must operate on the RECONCILED state
+    (re-read from RuntimeStore after _reconcile_credential_state), not on the
+    stale pre-reconcile snapshot list.
+    """
+    from hunter.pool_api import PoolControlClient, PoolControlServer
+
+    data_dir, registry, evidence_store, pool = _seed(
+        outside_repo_tmp_path / "data", hunter_root=None
+    )
+    _drive_to_approval(data_dir, pool)
+    pool.promote("acme")
+    assert pool.list_production() == ["acme"]
+    store = RuntimeStore(
+        data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
+    )
+    rp = store.get_provider("acme")
+    # Stale snapshot: runtime says UNKNOWN although the pool is serving it.
+    store.upsert(
+        RuntimeProvider(**{**rp.__dict__, "actual_pool_status": ActualPoolStatus.UNKNOWN}),
+        changed_fields=["actual_pool_status"],
+        reason="simulate stale snapshot",
+    )
+    # Registry downgrades to NOT_FREE — provider must leave production.
+    registry.upsert_provider(
+        _registry_provider(status=ProviderStatus.NOT_FREE),
+        reason="offer withdrawn",
+        source_metadata={"t": True},
+    )
+    # Real server + client (plan stage-1 requirement: no fake Client).
+    server = PoolControlServer(pool, bearer_token="test-control-token")
+    server.start_background()
+    try:
+        client = PoolControlClient(server.url, "test-control-token")
+        runner = Stage2Runner(
+            data_dir=data_dir,
+            pool_control=client,
+            registry=registry,
+            evidence_store=evidence_store,
+        )
+        summary = runner.run()
+    finally:
+        server.shutdown()
+    assert summary.suspended == ["acme"]
+    assert pool.list_production() == []
+    # Runtime persisted non-production state
+    persisted = RuntimeStore(
+        data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
+    ).get_provider("acme")
+    assert persisted.actual_pool_status != ActualPoolStatus.PRODUCTION
+    # No re-promotion in the same run
+    assert summary.promoted == []
+
+
+@pytest.mark.parametrize("downgrade", [ProviderStatus.UNCERTAIN, ProviderStatus.EXPIRED])
+def test_suspend_first_same_round_parametrized_statuses(
+    tmp_path: Path, outside_repo_tmp_path: Path, downgrade: ProviderStatus
+) -> None:
+    """UNCERTAIN / EXPIRED downgrades also suspend in the same round."""
+    from hunter.pool_api import PoolControlClient, PoolControlServer
+
+    data_dir, registry, evidence_store, pool = _seed(
+        outside_repo_tmp_path / "data", hunter_root=None
+    )
+    _drive_to_approval(data_dir, pool)
+    pool.promote("acme")
+    store = RuntimeStore(
+        data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
+    )
+    rp = store.get_provider("acme")
+    store.upsert(
+        RuntimeProvider(**{**rp.__dict__, "actual_pool_status": ActualPoolStatus.UNKNOWN}),
+        changed_fields=["actual_pool_status"],
+        reason="simulate stale snapshot",
+    )
+    registry.upsert_provider(
+        _registry_provider(status=downgrade),
+        reason="downgrade",
+        source_metadata={"t": True},
+    )
+    server = PoolControlServer(pool, bearer_token="test-control-token")
+    server.start_background()
+    try:
+        client = PoolControlClient(server.url, "test-control-token")
+        runner = Stage2Runner(
+            data_dir=data_dir,
+            pool_control=client,
+            registry=registry,
+            evidence_store=evidence_store,
+        )
+        summary = runner.run()
+    finally:
+        server.shutdown()
+    assert summary.suspended == ["acme"]
+    assert pool.list_production() == []
+
+
 def test_runtime_status_has_distinct_revisions(tmp_path: Path, capsys) -> None:
     """runtime status returns runtime_revision and registry_revision separately."""
     data_dir, registry, evidence_store, pool = _seed(tmp_path)

@@ -175,12 +175,16 @@ class Stage2Runner:
 
     def _reconcile_credential_state(
         self, store: RuntimeStore, summary: Stage2Summary
-    ) -> None:
+    ) -> List[RuntimeProvider]:
         """Reconcile Runtime credential_status and actual_pool_status from
         sanitized PoolControlClient status (never sees keys or paths).
 
         Called once before suspend-first and again after import so newly
         imported providers also get reconciled before checks.
+
+        Returns the post-reconciliation authoritative provider list re-read
+        from the RuntimeStore; callers MUST use this instead of any snapshot
+        taken before reconciliation (same-round suspend-first depends on it).
         """
         for rp in store.list_providers():
             try:
@@ -242,6 +246,7 @@ class Stage2Runner:
                 changed_fields=changed,
                 reason="credential_reconciliation",
             )
+        return store.list_providers()
 
     # -- the run -----------------------------------------------------------
 
@@ -265,8 +270,9 @@ class Stage2Runner:
             providers = store.list_providers()
             summary.providers_read = len(providers)
 
-            # (2b) reconcile credential and pool state from Pool Control
-            self._reconcile_credential_state(store, summary)
+            # (2b) reconcile credential and pool state from Pool Control.
+            # Use the RECONCILED list, never the pre-reconcile snapshot.
+            providers = self._reconcile_credential_state(store, summary)
 
             # (3)+(4) reconcile registry, suspend invalid FIRST
             self._suspend_invalid_first(store, providers, summary)
@@ -314,7 +320,9 @@ class Stage2Runner:
         providers: List[RuntimeProvider],
         summary: Stage2Summary,
     ) -> None:
-        for rp in providers:
+        # Re-read the authoritative state: callers may pass a pre-reconcile
+        # snapshot, and suspend-first must act on reconciled pool state.
+        for rp in store.list_providers():
             if rp.actual_pool_status != ActualPoolStatus.PRODUCTION:
                 continue
             registry_provider = self.registry.get_provider(rp.provider_id)
