@@ -110,12 +110,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="data directory (defaults to config paths.data_dir)",
     )
+    pipeline.add_argument(
+        "--require-llm",
+        action="store_true",
+        help="exit nonzero unless the real grounded LLM extractor is configured",
+    )
     pipeline.set_defaults(handler=_handle_pipeline)
 
     alias = subparsers.add_parser("pipeline", help="alias for run-stage-one")
     alias.add_argument("--seed", default=None)
     alias.add_argument("--as-of", default=None)
     alias.add_argument("--data-dir", default=None)
+    alias.add_argument("--require-llm", action="store_true")
     alias.set_defaults(handler=_handle_pipeline)
 
     # Stage 2 subcommands (nested parsers; handlers live in cli_imports and
@@ -283,6 +289,8 @@ def _plain_text_excerpt(text: str) -> str:
 def _handle_pipeline(args: argparse.Namespace) -> int:
     from datetime import datetime, timezone
 
+    from .llm.client import LlmConfigurationError
+    from .llm.runtime import build_grounded_extractor_from_env
     from .pipeline import Pipeline
 
     if args.data_dir:
@@ -290,10 +298,23 @@ def _handle_pipeline(args: argparse.Namespace) -> int:
     else:
         settings = load_settings()
         data_dir = Path(settings["paths"]["data_dir"])
+    try:
+        extractor = build_grounded_extractor_from_env()
+    except LlmConfigurationError as exc:
+        print(f"hunter: {exc}", file=sys.stderr)
+        return 2
+    if args.require_llm and extractor is None:
+        print(
+            "hunter: a real grounded LLM extractor is required; configure "
+            "HUNTER_LLM_BASE_URL, HUNTER_LLM_API_KEY, and HUNTER_LLM_MODEL",
+            file=sys.stderr,
+        )
+        return 2
     pipeline = Pipeline(
         data_dir=data_dir,
         seed_path=Path(args.seed) if args.seed else None,
         as_of=datetime.fromisoformat(args.as_of) if args.as_of else datetime.now(timezone.utc),
+        extractor=extractor,
     )
     summary = pipeline.run()
     for key in (
