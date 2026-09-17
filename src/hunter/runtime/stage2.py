@@ -283,9 +283,15 @@ class Stage2Runner:
             # (6) import new FREE_CONFIRMED providers
             self._import_new_confirmed(store, summary)
 
-            # (6b) reconcile newly imported providers once more before checks
-            self._reconcile_credential_state(store, summary)
+            # (6b) reconcile newly imported providers once more before checks.
+            # A first-read failure can leave UNKNOWN providers skipped above;
+            # the retry may now discover PRODUCTION. Re-apply containment to
+            # that authoritative state before probes/promotions (HIGH fix).
+            providers = self._reconcile_credential_state(store, summary)
+            self._suspend_invalid_first(store, providers, summary)
 
+            # Recover notification intent only after containment checks.
+            self._recover_suspension_alerts(summary)
             # (7) deliver outbox notifications (idempotent consumer)
             summary.notifications_delivered = self._deliver_notifications()
 
@@ -312,6 +318,59 @@ class Stage2Runner:
                 self._lock.release()
         return summary
 
+    def _suspension_intents(self) -> dict:
+        import json
+
+        path = self.data_dir / "suspension_alert_intents.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+    def _save_suspension_intents(self, intents: dict) -> None:
+        from ..pool_toml import atomic_write_json
+
+        atomic_write_json(self.data_dir / "suspension_alert_intents.json", intents)
+
+    def _recover_suspension_alerts(self, summary: Stage2Summary) -> None:
+        from .outbox import OutboxMessage
+
+        intents = self._suspension_intents()
+        if not intents:
+            return
+        outbox = self._open_outbox_or_none(summary, "recovery")
+        if outbox is None:
+            return
+        try:
+            for pid, intent in list(intents.items()):
+                # This records an intent, not a claim of successful suspension.
+                # Deterministic ID permits replay after enqueue/save crashes.
+                outbox.enqueue(OutboxMessage(
+                    event_id=intent["event_id"], provider_id=pid,
+                    provider_name=pid, event_type="PRODUCTION_BLOCKED",
+                    title="Production containment requested",
+                    body="A suspension was requested. Review runtime and pool state for its outcome.",
+                ))
+                del intents[pid]
+                self._save_suspension_intents(intents)
+        finally:
+            outbox.close()
+
+    def _open_outbox_or_none(
+        self, summary: Stage2Summary, context: str
+    ) -> Optional[OutboxStore]:
+        """Open the outbox without ever blocking a containment action.
+
+        Containment (suspend/halt) must not depend on notification storage:
+        a concurrent drain holds .outbox.lock across real network delivery,
+        and eager acquisition used to abort suspension before the pool call.
+        On contention/failure we record a diagnostic note; the separately
+        persisted suspension intent is replayed after the delivery lock clears.
+        """
+        try:
+            return OutboxStore(self.outbox_path)
+        except Exception as exc:  # noqa: BLE001 - containment must proceed
+            code = exc.__class__.__name__
+            summary.notes.append(f"outbox_unavailable_{context}:{code}")
+            return None
+
     # -- step 3/4: reconcile + suspend-first ---------------------------------
 
     def _suspend_invalid_first(
@@ -324,6 +383,9 @@ class Stage2Runner:
         # snapshot, and suspend-first must act on reconciled pool state.
         for rp in store.list_providers():
             if rp.actual_pool_status != ActualPoolStatus.PRODUCTION:
+                continue
+            if rp.provider_id in summary.suspend_failed:
+                # Already attempted and contained by halt in this round.
                 continue
             registry_provider = self.registry.get_provider(rp.provider_id)
             reason: Optional[str] = None
@@ -344,13 +406,29 @@ class Stage2Runner:
                         reason = f"approval_binding_{gate.detail}"
             if reason is None:
                 continue
-            result = suspend_from_production(
-                rp.provider_id,
-                store,
-                self.pool_control,
-                reason=reason,
-                outbox_store=self._open_outbox(),
-            )
+            # Persist intent separately under the stage lock before action;
+            # the outbox lock belongs to delivery and must not gate containment.
+            intent_error = False
+            try:
+                intents = self._suspension_intents()
+                intents[rp.provider_id] = {
+                    "event_id": f"containment-{rp.provider_id}-{rp.revision}",
+                }
+                self._save_suspension_intents(intents)
+            except Exception:
+                intent_error = True
+            outbox = self._open_outbox_or_none(summary, "suspend")
+            try:
+                result = suspend_from_production(
+                    rp.provider_id, store, self.pool_control,
+                    reason=reason, outbox_store=outbox,
+                )
+            finally:
+                if outbox is not None:
+                    outbox.close()
+            if intent_error:
+                # Storage failures must surface, but only AFTER containment.
+                raise Stage2Error("suspension_alert_intent_write_failed")
             if result.success:
                 summary.suspended.append(rp.provider_id)
             else:
@@ -424,6 +502,8 @@ class Stage2Runner:
 
     def _promote_approved(self, store: RuntimeStore, summary: Stage2Summary) -> None:
         for rp in store.list_providers():
+            if rp.provider_id in summary.suspended or rp.provider_id in summary.suspend_failed:
+                continue  # never re-enter promotion for this round's containment targets
             if rp.approval_status != ApprovalStatus.APPROVED:
                 continue
             if rp.expected_pool_status == ExpectedPoolStatus.PRODUCTION:

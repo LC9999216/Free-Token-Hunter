@@ -719,6 +719,128 @@ def test_suspend_first_same_round_parametrized_statuses(
     assert pool.list_production() == []
 
 
+# =============================================================================
+# HIGH remediation: suspension containment must not depend on outbox lock
+# =============================================================================
+
+
+def test_suspend_survives_outbox_lock_contention(
+    tmp_path: Path, outside_repo_tmp_path: Path, monkeypatch
+) -> None:
+    """A held .outbox.lock must never prevent same-round suspension.
+
+    Regression: _suspend_invalid_first evaluated _open_outbox() as a call
+    argument BEFORE suspend_from_production ran, so LockHeldError aborted the
+    run and the invalid provider kept serving in production.
+    """
+    from hunter.runtime.locks import LockHeldError
+
+    data_dir, registry, evidence_store, pool = _seed(
+        outside_repo_tmp_path / "data", hunter_root=None
+    )
+    _drive_to_approval(data_dir, pool)
+    pool.promote("acme")
+    store = RuntimeStore(
+        data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
+    )
+    rp = store.get_provider("acme")
+    store.upsert(
+        RuntimeProvider(**{**rp.__dict__, "actual_pool_status": ActualPoolStatus.PRODUCTION}),
+        changed_fields=["actual_pool_status"],
+        reason="in production",
+    )
+    registry.upsert_provider(
+        _registry_provider(status=ProviderStatus.NOT_FREE),
+        reason="offer withdrawn",
+        source_metadata={"t": True},
+    )
+
+    def locked_outbox(*args, **kwargs):
+        raise LockHeldError("another process holds the outbox lock")
+
+    monkeypatch.setattr("hunter.runtime.stage2.OutboxStore", locked_outbox)
+    runner = Stage2Runner(
+        data_dir=data_dir,
+        pool_control=pool,
+        registry=registry,
+        evidence_store=evidence_store,
+    )
+    summary = runner.run()
+    # Containment happened despite the outbox contention
+    assert summary.suspended == ["acme"]
+    assert pool.list_production() == []
+    assert any("outbox" in note.lower() for note in summary.notes)
+    intent_path = data_dir / "suspension_alert_intents.json"
+    assert "acme" in json.loads(intent_path.read_text(encoding="utf-8"))
+    monkeypatch.undo()
+    runner.run()
+    assert json.loads(intent_path.read_text(encoding="utf-8")) == {}
+    outbox = OutboxStore(data_dir / "notification_outbox.json")
+    try:
+        assert any(m.event_type == "PRODUCTION_BLOCKED" for m in outbox.pending())
+    finally:
+        outbox.close()
+
+
+def test_second_reconciliation_cannot_restore_invalid_production(
+    tmp_path: Path, outside_repo_tmp_path: Path
+) -> None:
+    """If the first reconciliation fails and the retry later reports the
+    provider in production, the same round must still suspend it — the
+    invalid provider must not survive because checks ran before the retry.
+
+    Regression (pre-existing): first status raise left the provider UNKNOWN
+    (skipped by suspend-first); the second reconciliation then wrote
+    PRODUCTION for a NOT_FREE provider and final verification saw matching
+    states, so nothing halted.
+    """
+    data_dir, registry, evidence_store, pool = _seed(
+        outside_repo_tmp_path / "data", hunter_root=None
+    )
+    _drive_to_approval(data_dir, pool)
+    pool.promote("acme")
+    store = RuntimeStore(
+        data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
+    )
+    rp = store.get_provider("acme")
+    store.upsert(
+        RuntimeProvider(**{**rp.__dict__, "actual_pool_status": ActualPoolStatus.UNKNOWN}),
+        changed_fields=["actual_pool_status"],
+        reason="stale snapshot",
+    )
+    registry.upsert_provider(
+        _registry_provider(status=ProviderStatus.NOT_FREE),
+        reason="offer withdrawn",
+        source_metadata={"t": True},
+    )
+
+    real_status = pool.status
+    calls = {"n": 0}
+
+    def flaky_status(provider_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("transient first reconciliation failure")
+        from dataclasses import asdict
+        return asdict(real_status(provider_id))
+
+    pool.status = flaky_status  # type: ignore[method-assign]
+    runner = Stage2Runner(
+        data_dir=data_dir,
+        pool_control=pool,
+        registry=registry,
+        evidence_store=evidence_store,
+    )
+    summary = runner.run()
+    # The provider must not survive the round in production
+    assert pool.list_production() == []
+    assert summary.suspended == ["acme"]
+    persisted = RuntimeStore(
+        data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl"
+    ).get_provider("acme")
+    assert persisted.actual_pool_status != ActualPoolStatus.PRODUCTION
+
+
 def test_runtime_status_has_distinct_revisions(tmp_path: Path, capsys) -> None:
     """runtime status returns runtime_revision and registry_revision separately."""
     data_dir, registry, evidence_store, pool = _seed(tmp_path)
@@ -1236,8 +1358,10 @@ def test_run_stage_two_wires_feishu_adapter(monkeypatch, tmp_path) -> None:
 # =============================================================================
 
 
-def test_cli_client_config_write_offline(tmp_path: Path, capsys) -> None:
-    """hunter client-config write generates files from runtime state."""
+def test_cli_client_config_write_offline(tmp_path: Path, capsys, monkeypatch) -> None:
+    """Runtime state alone must not generate production client configuration."""
+    monkeypatch.delenv("HUNTER_POOL_CONTROL_URL", raising=False)
+    monkeypatch.delenv("HUNTER_POOL_CONTROL_TOKEN", raising=False)
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True)
     from hunter.runtime.store import RuntimeStore
@@ -1262,10 +1386,9 @@ def test_cli_client_config_write_offline(tmp_path: Path, capsys) -> None:
         "--data-dir", str(data_dir),
         "--output-dir", str(output_dir),
     ])
-    assert code == 0
+    assert code == 2
     out = capsys.readouterr().out
-    assert (output_dir / "codex-providers.toml").is_file()
-    assert (output_dir / "opencode.json").is_file()
-    assert (output_dir / "agent-providers.yaml").is_file()
+    assert "pool_control_not_configured" in out
+    assert not output_dir.exists()
     assert "sk-" not in out
     assert "Bearer " not in out
