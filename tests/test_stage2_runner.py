@@ -39,6 +39,7 @@ from hunter.runtime.models import (
     RuntimeProvider,
 )
 from hunter.runtime.stage2 import Stage2Runner, Stage2Summary, approve_provider, runtime_status
+from hunter.runtime.outbox import OutboxStore
 from hunter.runtime.store import RuntimeStore
 
 AS_OF = datetime.fromisoformat("2026-09-12T00:00:00+00:00")
@@ -961,36 +962,245 @@ def test_pool_stop_success_exits_zero_and_sanitized(
 # =============================================================================
 
 
-def test_notifications_drain_command(tmp_path: Path, capsys) -> None:
-    """hunter notifications drain clears pending outbox entries."""
+def test_notifications_drain_command(tmp_path: Path, capsys, monkeypatch) -> None:
+    """Configured empty outbox does not attempt network delivery."""
+    monkeypatch.setenv("HUNTER_FEISHU_WEBHOOK_URL", "https://example.invalid/offline-webhook")
+    monkeypatch.setattr("hunter.runtime.notify.urllib.request.urlopen", lambda *a, **kw: pytest.fail("unexpected network"))
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True)
-    # Seed a pending outbox message
-    from hunter.runtime.outbox import OutboxStore
-    from hunter.runtime.models import RuntimeProvider
-    from hunter.runtime.store import RuntimeStore
-    store = RuntimeStore(data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl")
-    store.upsert(RuntimeProvider(provider_id="acme"), reason="setup")
-    outbox = OutboxStore(data_dir / "notification_outbox.json")
-    from hunter.runtime.outbox import OutboxMessage
-    msg = OutboxMessage(
-        event_id="test-ev-001",
-        provider_id="acme",
-        provider_name="Acme AI",
-        event_type="NEW_HIGH_VALUE",
-        title="Test notification",
-        body="Test body",
-    )
-    from hunter.runtime.notify import build_feishu_payload
-    outbox.enqueue(msg)
-    assert len(outbox.pending()) == 1
     code = cli_main(["notifications", "drain", "--data-dir", str(data_dir)])
     out = capsys.readouterr().out
     assert code == 0
-    assert '"drained": 1' in out
-    # Outbox should now have 0 pending
-    outbox2 = OutboxStore(data_dir / "notification_outbox.json")
-    assert len(outbox2.pending()) == 0
+    parsed = json.loads(out)
+    assert parsed["sent"] == []
+    assert parsed["failed"] == []
+    assert OutboxStore(data_dir / "notification_outbox.json").pending() == []
+
+
+# =============================================================================
+# notifications drain = real delivery before mark-sent (remediation plan stage 3)
+# =============================================================================
+
+
+def _seed_pending_outbox(data_dir: Path, event_id: str = "test-ev-001"):
+    from hunter.runtime.outbox import OutboxMessage, OutboxStore
+    outbox = OutboxStore(data_dir / "notification_outbox.json")
+    outbox.enqueue(
+        OutboxMessage(
+            event_id=event_id,
+            provider_id="acme",
+            provider_name="Acme AI",
+            event_type="NEW_HIGH_VALUE",
+            title="Test notification",
+            body="Test body",
+        )
+    )
+    outbox.close()
+    return event_id
+
+
+class _RecordingAdapter:
+    """Offline adapter recording send() calls; configurable failure."""
+
+    def __init__(self, fail: bool = False):
+        self.calls: list[str] = []
+        self.fail = fail
+
+    def send(self, message) -> None:
+        self.calls.append(message.event_id)
+        if self.fail:
+            from hunter.runtime.notify import NotificationError
+            raise NotificationError("feishu_unreachable")
+
+
+def test_drain_without_webhook_env_fails_closed_pending_unchanged(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """No HUNTER_FEISHU_WEBHOOK_URL → config error, pending NOT marked sent."""
+    monkeypatch.delenv("HUNTER_FEISHU_WEBHOOK_URL", raising=False)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    eid = _seed_pending_outbox(data_dir)
+    code = cli_main(["notifications", "drain", "--data-dir", str(data_dir)])
+    out = capsys.readouterr().out
+    assert code == 2
+    reopened = OutboxStore(data_dir / "notification_outbox.json")
+    pending_ids = [m.event_id for m in reopened.pending()]
+    assert pending_ids == [eid]
+
+
+def test_drain_marks_sent_only_after_adapter_success(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """Adapter success happens BEFORE mark-sent; second drain does not resend."""
+    monkeypatch.setenv("HUNTER_FEISHU_WEBHOOK_URL", "https://example.invalid/offline-webhook")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    eid = _seed_pending_outbox(data_dir)
+    from hunter.runtime.notify import WebhookFeishuAdapter
+    from hunter.runtime.outbox import OutboxStore
+
+    recorded: dict[str, object] = {}
+
+    class RecordingAdapter(WebhookFeishuAdapter):
+        def __init__(self, webhook_url: str):
+            super().__init__(webhook_url)
+            self.calls: list[str] = []
+
+        def send(self, message) -> None:
+            recorded.setdefault("order", []).append(("send", message.event_id))
+            self.calls = getattr(self, "calls", [])
+            self.calls.append(message.event_id)
+
+    monkeypatch.setattr(
+        "hunter.runtime.notify.WebhookFeishuAdapter", RecordingAdapter, raising=False
+    )
+    code = cli_main(["notifications", "drain", "--data-dir", str(data_dir)])
+    out = capsys.readouterr().out
+    assert code == 0
+    parsed = json.loads(out)
+    assert parsed["sent"] == [eid]
+    assert recorded["order"] == [("send", eid)]
+    reopened = OutboxStore(data_dir / "notification_outbox.json")
+    assert [m.event_id for m in reopened.sent()] == [eid]
+    assert reopened.pending() == []
+    # Second drain: nothing pending, adapter not called again
+    code2 = cli_main(["notifications", "drain", "--data-dir", str(data_dir)])
+    out2 = capsys.readouterr().out
+    assert code2 == 0
+    assert json.loads(out2)["sent"] == []
+
+
+def test_drain_adapter_failure_keeps_pending_and_nonzero(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """Adapter failure → pending preserved, attempts/next_retry updated, exit 1."""
+    monkeypatch.setenv("HUNTER_FEISHU_WEBHOOK_URL", "https://example.invalid/offline-webhook")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    eid = _seed_pending_outbox(data_dir)
+    from hunter.runtime.notify import WebhookFeishuAdapter
+
+    class FailingAdapter(WebhookFeishuAdapter):
+        def send(self, message) -> None:
+            from hunter.runtime.notify import NotificationError
+            raise NotificationError("feishu_unreachable")
+
+    monkeypatch.setattr(
+        "hunter.runtime.notify.WebhookFeishuAdapter", FailingAdapter, raising=False
+    )
+    code = cli_main(["notifications", "drain", "--data-dir", str(data_dir)])
+    out = capsys.readouterr().out
+    assert code == 1
+    reopened = OutboxStore(data_dir / "notification_outbox.json")
+    pending = reopened.pending()
+    assert [m.event_id for m in pending] == [eid]
+    assert pending[0].attempts == 1
+    assert pending[0].last_error_code == "feishu_unreachable"
+    assert pending[0].next_retry_at is not None
+    assert parsed_failure_guard(out)
+
+
+def parsed_failure_guard(out: str) -> bool:
+    """Failure output names the failed event, never secrets."""
+    parsed = json.loads(out)
+    return parsed["failed"] == ["test-ev-001"]
+
+
+def test_drain_http_200_but_app_level_failure_not_marked_sent(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """HTTP 200 with Feishu application-layer error code must NOT mark-sent."""
+    monkeypatch.setenv("HUNTER_FEISHU_WEBHOOK_URL", "https://example.invalid/offline-webhook")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    eid = _seed_pending_outbox(data_dir)
+    from hunter.runtime.notify import WebhookFeishuAdapter
+    from hunter.runtime.outbox import OutboxStore
+
+    class AppFailureAdapter(WebhookFeishuAdapter):
+        def send(self, message) -> None:
+            from hunter.runtime.notify import NotificationError
+            raise NotificationError("feishu_app_error")
+
+    monkeypatch.setattr(
+        "hunter.runtime.notify.WebhookFeishuAdapter", AppFailureAdapter, raising=False
+    )
+    code = cli_main(["notifications", "drain", "--data-dir", str(data_dir)])
+    reopened = OutboxStore(data_dir / "notification_outbox.json")
+    assert code == 1
+    assert [m.event_id for m in reopened.pending()] == [eid]
+    assert reopened.sent() == []
+
+
+def test_drain_retry_not_due_and_max_attempts_reported_skipped(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """Retry-not-due and over-max-attempts messages are skipped, not faked sent."""
+    monkeypatch.setenv("HUNTER_FEISHU_WEBHOOK_URL", "https://example.invalid/offline-webhook")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    from datetime import datetime, timedelta, timezone
+    from hunter.runtime.outbox import OutboxMessage, OutboxStore
+
+    now = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    outbox = OutboxStore(data_dir / "notification_outbox.json")
+    outbox.enqueue(
+        OutboxMessage(
+            event_id="evt-retry-wait",
+            provider_id="acme",
+            provider_name="Acme AI",
+            event_type="NEW_HIGH_VALUE",
+            title="t",
+            body="b",
+            timestamp=now,
+            next_retry_at=now + timedelta(seconds=120),
+        )
+    )
+    outbox.enqueue(
+        OutboxMessage(
+            event_id="evt-dead",
+            provider_id="acme",
+            provider_name="Acme AI",
+            event_type="NEW_HIGH_VALUE",
+            title="t",
+            body="b",
+            timestamp=now,
+            attempts=10,
+        )
+    )
+    outbox.close()
+
+    from hunter.runtime.notify import WebhookFeishuAdapter
+
+    class NeverAdapter(WebhookFeishuAdapter):
+        def __init__(self, webhook_url: str):
+            super().__init__(webhook_url)
+            self.calls: list[str] = []
+
+        def send(self, message) -> None:
+            self.calls.append(message.event_id)
+
+    monkeypatch.setattr(
+        "hunter.runtime.notify.WebhookFeishuAdapter", NeverAdapter, raising=False
+    )
+
+    from hunter.runtime.notify import OutboxConsumer
+
+    def _consumer_with_clock(outbox_store, adapter):
+        return OutboxConsumer(outbox_store, adapter, clock=lambda: now)
+
+    monkeypatch.setattr(
+        "hunter.runtime.notify.OutboxConsumer", _consumer_with_clock
+    )
+    code = cli_main(["notifications", "drain", "--data-dir", str(data_dir)])
+    out = capsys.readouterr().out
+    assert code == 0
+    parsed = json.loads(out)
+    assert parsed["sent"] == []
+    assert sorted(parsed["skipped_retry"]) == ["evt-dead", "evt-retry-wait"]
+    reopened = OutboxStore(data_dir / "notification_outbox.json")
+    assert len(reopened.pending()) == 2
 
 
 def test_run_stage_two_wires_feishu_adapter(monkeypatch, tmp_path) -> None:

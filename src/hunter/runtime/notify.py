@@ -82,10 +82,25 @@ class WebhookFeishuAdapter(FeishuAdapter):
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 status = response.status
+                body = response.read(4096)
         except Exception:  # noqa: BLE001 - classified, message never surfaces
             raise NotificationError("feishu_unreachable") from None
         if status != 200:
             raise NotificationError("feishu_rejected")
+        # Feishu custom-bot contract: HTTP 200 alone is NOT success. The
+        # application layer must report code == 0 ("msg": "success");
+        # e.g. code 19024 keyword mismatch arrives with HTTP 200.
+        try:
+            decoded = json.loads(body.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            raise NotificationError("feishu_app_error") from None
+        code = decoded.get("code") if isinstance(decoded, dict) else None
+        if code is None and isinstance(decoded, dict) and decoded.get("msg") == "success":
+            # Legacy responses expose StatusCode/StatusMessage only.
+            legacy = decoded.get("StatusCode", 0)
+            code = 0 if legacy in (0, "0", None) else legacy
+        if code != 0:
+            raise NotificationError("feishu_app_error")
 
 
 @dataclass

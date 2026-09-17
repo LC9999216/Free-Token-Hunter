@@ -174,21 +174,56 @@ def _handle_client_config_write(args) -> int:  # noqa: ANN001
 
 
 def _handle_notifications_drain(args) -> int:  # noqa: ANN001
-    """Drain the notification outbox."""
+    """Deliver pending outbox messages through a real adapter.
+
+    Order is authoritative: adapter.send() MUST succeed before mark-sent.
+    Without HUNTER_FEISHU_WEBHOOK_URL this fails closed (exit 2) and keeps
+    every message pending; delivery failures keep messages pending (exit 1).
+    """
     import json
 
+    from .runtime.notify import NotificationError, OutboxConsumer
     from .runtime.outbox import OutboxStore
 
     data_dir = _resolve_data_dir(args)
-    outbox_path = data_dir / "notification_outbox.json"
-    outbox = OutboxStore(outbox_path)
-    pending = outbox.pending()
-    sent_ids: list[str] = []
-    for msg in pending:
-        outbox.mark_sent(msg.event_id)
-        sent_ids.append(msg.event_id)
-    outbox.save()
-    print(json.dumps({"drained": len(sent_ids), "event_ids": sent_ids}, indent=2))
+    webhook_url = os.environ.get("HUNTER_FEISHU_WEBHOOK_URL", "")
+    if not webhook_url:
+        print(
+            json.dumps(
+                {
+                    "error": "feishu_webhook_not_configured",
+                    "sent": [],
+                    "failed": [],
+                    "skipped_retry": [],
+                },
+                indent=2,
+            )
+        )
+        return 2
+
+    from .runtime.notify import WebhookFeishuAdapter
+    from .runtime.outbox import OutboxStore
+
+    outbox = OutboxStore(data_dir / "notification_outbox.json")
+    try:
+        adapter = WebhookFeishuAdapter(webhook_url)
+        consumer = OutboxConsumer(outbox, adapter)
+        result = consumer.process_once()
+    finally:
+        outbox.close()
+    print(
+        json.dumps(
+            {
+                "drained": len(result.sent),
+                "sent": list(result.sent),
+                "failed": list(result.failed),
+                "skipped_retry": list(result.skipped_retry),
+            },
+            indent=2,
+        )
+    )
+    if result.failed:
+        return 1
     return 0
 
 
