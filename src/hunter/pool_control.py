@@ -367,6 +367,7 @@ class PoolControl:
         safe_key_env = (
             key_env or f"{str(provider_id).upper().replace('-', '_')}_API_KEY"
         ).replace(" ", "_")
+        old_record = next((p for p in self._staging_providers() if p.get("id") == provider_id), None)
         providers = [
             p for p in self._staging_providers() if p.get("id") != provider_id
         ]
@@ -380,8 +381,16 @@ class PoolControl:
                 {"name": m.get("name", "")} for m in (models or [{"name": "default"}])
             ],
         }
+        old_key_env = str(old_record.get("key_env") or "") if old_record else ""
+        new_key_env = safe_key_env
+        keys = self._staging_keys()
+        # Re-registering with a NEW key_env must not silently accumulate the
+        # old secret: drop it only when no remaining provider references it.
+        if old_key_env and old_key_env != new_key_env:
+            if not any(p.get("key_env") == old_key_env for p in providers):
+                keys.pop(old_key_env, None)
         providers.append(record)
-        self._write_staging(providers, self._staging_keys())
+        self._write_staging(providers, keys)
         logger.info("registered provider %s in staging (no key material)", provider_id)
         return {"provider_id": str(provider_id), "registered": True, "key_env": safe_key_env}
 
@@ -430,20 +439,30 @@ class PoolControl:
         providers = [p for p in self._staging_providers() if p.get("id") != provider_id]
         keys = self._staging_keys()
         removed_key = False
+        retained_reason = ""
         record = next(
             (p for p in self._staging_providers() if p.get("id") == provider_id), None
         )
         if record is not None:
             key_env = str(record.get("key_env") or "")
             if key_env in keys:
-                del keys[key_env]
-                removed_key = True
+                # Shared key_env safety: only delete when no remaining
+                # provider still references it (remediation plan §5).
+                still_referenced = any(
+                    p.get("key_env") == key_env for p in providers
+                )
+                if still_referenced:
+                    retained_reason = "referenced_by_remaining_provider"
+                else:
+                    del keys[key_env]
+                    removed_key = True
         self._write_staging(providers, keys)
         logger.info("removed provider %s from staging", provider_id)
         return {
             "provider_id": provider_id,
             "removed": True,
             "key_removed": removed_key,
+            **({"key_retained_reason": retained_reason} if retained_reason else {}),
         }
 
     def _is_configured(self, provider_id: str) -> bool:

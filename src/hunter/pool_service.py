@@ -200,22 +200,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0 if configured else 1
 
         if args.command == "provider-status":
-            control, _, _ = _build_pool_components(
-                staging_dir=args.staging_dir,
-                production_dir=args.production_dir,
-                host="127.0.0.1",
-                proxy_port=8080,
-            )
-            status = control.status(args.provider_id)
-            print(
-                f"provider_id={status.provider_id} "
-                f"in_staging={status.in_staging} "
-                f"in_production={status.in_production} "
-                f"key_configured={status.key_configured} "
-                f"health_status={status.health_status} "
-                f"protocol_status={status.protocol_status} "
-                f"production_halted={status.production_halted}"
-            )
+            lock = _acquire_service_lock(args.production_dir)
+            try:
+                control, _, _ = _build_pool_components(
+                    staging_dir=args.staging_dir,
+                    production_dir=args.production_dir,
+                    host="127.0.0.1",
+                    proxy_port=8080,
+                )
+                status = control.status(args.provider_id)
+                print(
+                    f"provider_id={status.provider_id} "
+                    f"in_staging={status.in_staging} "
+                    f"in_production={status.in_production} "
+                    f"key_configured={status.key_configured} "
+                    f"health_status={status.health_status} "
+                    f"protocol_status={status.protocol_status} "
+                    f"production_halted={status.production_halted}"
+                )
+            finally:
+                lock.release()
             return 0
 
         if args.command == "remove-provider":
