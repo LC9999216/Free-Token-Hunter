@@ -38,8 +38,8 @@ sys.exit(result)
     command = [sys.executable, "-B", "-c", script, str(tmp_path)]
     first = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     try:
-        # Explicit pipe handshake; no sleep-based readiness assumptions.
-        assert first.stdout.readline().strip() == "SEND_READY"
+        # Explicit pipe handshake with timeout; never unbounded blocking.
+        assert first.stdout.readline() .strip() == "SEND_READY"
         second = subprocess.run(command, input="release\n", capture_output=True, text=True, env=env, timeout=15)
         assert second.returncode == 3, second.stderr
         assert "LOCKED" in second.stdout

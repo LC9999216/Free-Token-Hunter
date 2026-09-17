@@ -200,6 +200,7 @@ def _handle_notifications_drain(args) -> int:  # noqa: ANN001
                     "sent": [],
                     "failed": [],
                     "skipped_retry": [],
+                    "sent_count": 0, "failed_count": 0, "skipped_retry_count": 0,
                 },
                 indent=2,
             )
@@ -211,7 +212,8 @@ def _handle_notifications_drain(args) -> int:  # noqa: ANN001
     try:
         adapter = WebhookFeishuAdapter(webhook_url)
     except NotificationError as exc:
-        print(json.dumps({"error": exc.code, "sent": [], "failed": [], "skipped_retry": []}))
+        print(json.dumps({"error": exc.code, "sent": [], "failed": [], "skipped_retry": [],
+                          "sent_count": 0, "failed_count": 0, "skipped_retry_count": 0}))
         return 2
 
     outbox = OutboxStore(data_dir / "notification_outbox.json")
@@ -227,6 +229,9 @@ def _handle_notifications_drain(args) -> int:  # noqa: ANN001
                 "sent": list(result.sent),
                 "failed": list(result.failed),
                 "skipped_retry": list(result.skipped_retry),
+                "sent_count": len(result.sent),
+                "failed_count": len(result.failed),
+                "skipped_retry_count": len(result.skipped_retry),
             },
             indent=2,
         )

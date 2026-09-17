@@ -47,6 +47,9 @@ def test_real_adapter_acknowledgement_before_mark_sent(tmp_path, monkeypatch, ca
     code = main(["notifications", "drain", "--data-dir", str(tmp_path)])
     assert code == (0 if success else 1)
     assert len(calls) == 1
+    report = json.loads(capsys.readouterr().out)
+    for key in ("sent", "failed", "skipped_retry"):
+        assert report[key + "_count"] == len(report[key])
     reopened = OutboxStore(path)
     try:
         assert bool(reopened.sent()) is success
@@ -68,5 +71,8 @@ def test_webhook_payload_uses_only_documented_fields():
 def test_invalid_webhook_configuration_returns_two_without_touching_outbox(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HUNTER_FEISHU_WEBHOOK_URL", "invalid-offline-url")
     assert main(["notifications", "drain", "--data-dir", str(tmp_path)]) == 2
-    assert "feishu_webhook_not_configured" in capsys.readouterr().out
+    report = json.loads(capsys.readouterr().out)
+    assert report["error"] == "feishu_webhook_not_configured"
+    for key in ("sent", "failed", "skipped_retry"):
+        assert report[key + "_count"] == 0
     assert not (tmp_path / ".outbox.lock").exists()
