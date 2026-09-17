@@ -381,6 +381,7 @@ class Stage2Runner:
     ) -> None:
         # Re-read the authoritative state: callers may pass a pre-reconcile
         # snapshot, and suspend-first must act on reconciled pool state.
+        intent_error = False
         for rp in store.list_providers():
             if rp.actual_pool_status != ActualPoolStatus.PRODUCTION:
                 continue
@@ -408,7 +409,6 @@ class Stage2Runner:
                 continue
             # Persist intent separately under the stage lock before action;
             # the outbox lock belongs to delivery and must not gate containment.
-            intent_error = False
             try:
                 intents = self._suspension_intents()
                 intents[rp.provider_id] = {
@@ -426,9 +426,6 @@ class Stage2Runner:
             finally:
                 if outbox is not None:
                     outbox.close()
-            if intent_error:
-                # Storage failures must surface, but only AFTER containment.
-                raise Stage2Error("suspension_alert_intent_write_failed")
             if result.success:
                 summary.suspended.append(rp.provider_id)
             else:
@@ -437,6 +434,9 @@ class Stage2Runner:
                     f"suspend failed for {rp.provider_id}: {result.error}"
                 )
                 summary.production_halted = True
+        if intent_error:
+            # Auxiliary storage must not suppress containment of later providers.
+            raise Stage2Error("suspension_alert_intent_write_failed")
 
     # -- step 6: import new FREE_CONFIRMED ------------------------------------
 

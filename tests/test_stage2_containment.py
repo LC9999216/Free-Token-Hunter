@@ -78,3 +78,47 @@ finally:
             child.communicate(timeout=10)
         server.shutdown()
         reader.join(timeout=2)
+
+
+@pytest.mark.parametrize("mode", ["read", "write"])
+def test_intent_journal_failure_does_not_skip_remaining_providers(outside_repo_tmp_path, monkeypatch, mode):
+    """Two invalid production providers: a malformed/unwritable alert-intent
+    journal must not stop containment of the second provider. The storage
+    failure is reported only AFTER every required containment action."""
+    data_dir, registry, evidence, pool = _seed(
+        outside_repo_tmp_path / "case",
+        providers=[_registry_provider("acme"), _registry_provider("beacon")],
+        hunter_root=None,
+    )
+    for pid in ("acme", "beacon"):
+        _drive_to_approval(data_dir, pool, pid)
+        pool.promote(pid)
+        registry.upsert_provider(
+            _registry_provider(pid, status=ProviderStatus.NOT_FREE), reason="withdrawn", source_metadata={"fixture": True}
+        )
+    journal = data_dir / "suspension_alert_intents.json"
+    if mode == "read":
+        journal.write_text("{not valid json", encoding="utf-8")
+    else:
+        class BrokenWriter:
+            def __call__(self, path, payload):
+                raise OSError("fixture: intent journal write denied")
+        monkeypatch.setattr("hunter.runtime.stage2.Stage2Runner._save_suspension_intents", lambda self, intents: BrokenWriter()(journal, intents))
+
+    from dataclasses import asdict
+    real_status = pool.status
+
+    def dict_status(provider_id):
+        return asdict(real_status(provider_id))
+
+    pool.status = dict_status  # type: ignore[method-assign]
+
+    runner = Stage2Runner(data_dir=data_dir, registry=registry, evidence_store=evidence, pool_control=pool)
+    from hunter.runtime.stage2 import Stage2Error
+    with pytest.raises(Stage2Error, match="suspension_alert_intent_write_failed"):
+        runner.run()
+    # Failure must surface, but only AFTER containing BOTH providers.
+    assert pool.list_production() == []
+    if mode == "read":
+        # A malformed journal is NOT silently overwritten by this round.
+        assert journal.read_text(encoding="utf-8") == "{not valid json"
