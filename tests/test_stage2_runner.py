@@ -811,6 +811,152 @@ def test_cli_pool_suspend_refuses_without_confirm(tmp_path: Path) -> None:
 
 
 # =============================================================================
+# Operator confirm word + exit code enforcement (remediation plan stage 2)
+# =============================================================================
+
+
+class _CallCountingServer:
+    """Wraps PoolControlServer handlers to count client-visible calls."""
+
+    def __init__(self, pool, bearer_token: str):
+        from hunter.pool_api import PoolControlServer
+        self.suspend_calls = 0
+        self.stop_calls = 0
+        server = self
+
+        original_suspend = pool.suspend
+        original_stop = pool.stop_production
+
+        def counting_suspend(provider_id):
+            server.suspend_calls += 1
+            return original_suspend(provider_id)
+
+        def counting_stop(reason="manual_stop"):
+            server.stop_calls += 1
+            return original_stop(reason)
+
+        pool.suspend = counting_suspend  # type: ignore[method-assign]
+        pool.stop_production = counting_stop  # type: ignore[method-assign]
+        self.server = PoolControlServer(pool, bearer_token=bearer_token)
+
+    @property
+    def url(self):
+        return self.server.url
+
+    def start_background(self):
+        self.server.start_background()
+
+    def shutdown(self):
+        self.server.shutdown()
+
+
+def test_pool_suspend_wrong_confirm_word_makes_no_api_call(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """--confirm WRONG must be rejected BEFORE any env read or API call."""
+    data_dir, _, _, pool = _seed(tmp_path, hunter_root=None)
+    counting = _CallCountingServer(pool, "test-control-token")
+    counting.start_background()
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", counting.url)
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    try:
+        code = cli_main(
+            ["pool", "suspend", "--provider-id", "acme", "--confirm", "WRONG"]
+        )
+    finally:
+        counting.shutdown()
+    out = capsys.readouterr().out
+    assert code != 0
+    assert counting.suspend_calls == 0
+    assert "sk-" not in out
+    assert "test-control-token" not in out
+
+
+def test_pool_stop_wrong_confirm_word_makes_no_api_call(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """--confirm WRONG must be rejected BEFORE any env read or API call."""
+    data_dir, _, _, pool = _seed(tmp_path, hunter_root=None)
+    counting = _CallCountingServer(pool, "test-control-token")
+    counting.start_background()
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", counting.url)
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    try:
+        code = cli_main(["pool", "stop", "--confirm", "WRONG"])
+    finally:
+        counting.shutdown()
+    out = capsys.readouterr().out
+    assert code != 0
+    assert counting.stop_calls == 0
+    assert "test-control-token" not in out
+
+
+def test_pool_stop_halt_false_returns_nonzero(tmp_path: Path, capsys, monkeypatch) -> None:
+    """stop reports halted=false → exit 1 (truthful exit codes)."""
+    data_dir, _, _, pool = _seed(tmp_path, hunter_root=None)
+    from hunter.pool_api import PoolControlServer
+
+    def failing_stop(reason="manual_stop"):
+        return {"halted": False, "error": "control_state_write_failed"}
+
+    pool.stop_production = failing_stop  # type: ignore[method-assign]
+    server = PoolControlServer(pool, bearer_token="test-control-token")
+    server.start_background()
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", server.url)
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    try:
+        code = cli_main(["pool", "stop", "--confirm", "STOP"])
+    finally:
+        server.shutdown()
+    out = capsys.readouterr().out
+    assert code == 1
+    assert '"halted": false' in out
+
+
+def test_pool_stop_proxy_halt_failed_returns_nonzero(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """halted=true but error=proxy_halt_failed → exit 1, error preserved."""
+    data_dir, _, _, pool = _seed(tmp_path, hunter_root=None)
+    from hunter.pool_api import PoolControlServer
+
+    def partial_stop(reason="manual_stop"):
+        return {"halted": True, "error": "proxy_halt_failed"}
+
+    pool.stop_production = partial_stop  # type: ignore[method-assign]
+    server = PoolControlServer(pool, bearer_token="test-control-token")
+    server.start_background()
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", server.url)
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    try:
+        code = cli_main(["pool", "stop", "--confirm", "STOP"])
+    finally:
+        server.shutdown()
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "proxy_halt_failed" in out
+
+
+def test_pool_stop_success_exits_zero_and_sanitized(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    data_dir, _, _, pool = _seed(tmp_path, hunter_root=None)
+    from hunter.pool_api import PoolControlServer
+    server = PoolControlServer(pool, bearer_token="test-control-token")
+    server.start_background()
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_URL", server.url)
+    monkeypatch.setenv("HUNTER_POOL_CONTROL_TOKEN", "test-control-token")
+    try:
+        code = cli_main(["pool", "stop", "--confirm", "STOP"])
+    finally:
+        server.shutdown()
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "test-control-token" not in out
+    assert "sk-" not in out
+
+
+# =============================================================================
 # Feishu webhook wiring and outbox drain (Problem 1.4.2D)
 # =============================================================================
 

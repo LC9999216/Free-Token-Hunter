@@ -91,6 +91,12 @@ def _handle_pool_suspend(args) -> int:  # noqa: ANN001
     """Suspend a provider from the production pool via PoolControlClient."""
     import json
 
+    # Enforce the exact literal BEFORE any env read or network call; argparse
+    # required-ness alone does not stop a wrong value like --confirm WRONG.
+    if args.confirm != "SUSPEND":
+        print(json.dumps({"ok": False, "error": "confirm_word_mismatch"}))
+        return 2
+
     from .pool_api import PoolControlClient
 
     base_url = os.environ.get("HUNTER_POOL_CONTROL_URL", "")
@@ -107,6 +113,11 @@ def _handle_pool_stop(args) -> int:  # noqa: ANN001
     """Halt production containment via PoolControlClient."""
     import json
 
+    # Enforce the exact literal BEFORE any env read or network call.
+    if args.confirm != "STOP":
+        print(json.dumps({"ok": False, "error": "confirm_word_mismatch"}))
+        return 2
+
     from .pool_api import PoolControlClient
 
     base_url = os.environ.get("HUNTER_POOL_CONTROL_URL", "")
@@ -116,7 +127,10 @@ def _handle_pool_stop(args) -> int:  # noqa: ANN001
     pc = PoolControlClient(base_url, token)
     result = pc.stop_production()
     print(json.dumps(result, indent=2))
-    return 0
+    # Truthful exit codes: success ONLY when halted is true and no error.
+    if result.get("halted") is True and not result.get("error"):
+        return 0
+    return 1
 
 
 def _handle_runtime_status(args) -> int:  # noqa: ANN001
