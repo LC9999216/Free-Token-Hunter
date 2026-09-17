@@ -168,6 +168,14 @@ class PoolControlHandler(BaseHTTPRequestHandler):
             self._deny(401, "unauthorized")
             return
         path = self.path.split("?")[0]
+        if path == "/pool/catalog":
+            try:
+                payload = self.pool_control.production_catalog()
+            except PoolControlError:
+                self._deny(409, "production_catalog_unavailable")
+                return
+            self._json_response(200, payload)
+            return
         if path == _POOL_STATUS_ROUTE:
             self._json_response(
                 200,
@@ -357,6 +365,14 @@ class PoolControlClient:
 
     def stop_production(self) -> Dict[str, Any]:
         return self._request("POST", "/pool/stop", body={})
+
+    def production_catalog(self) -> Dict[str, Any]:
+        from .client_config import ClientConfigError, validate_production_catalog
+
+        try:
+            return validate_production_catalog(self._request("GET", "/pool/catalog"))
+        except (ClientConfigError, ValueError, UnicodeError):
+            raise PoolApiError("invalid_production_catalog") from None
 
     def pool_status(self) -> Dict[str, Any]:
         return self._request("GET", _POOL_STATUS_ROUTE)

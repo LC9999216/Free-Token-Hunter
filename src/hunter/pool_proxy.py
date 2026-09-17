@@ -22,6 +22,8 @@ class ProxySupervisor(Protocol):
 
     def running_provider_ids(self) -> set[str]: ...
 
+    def production_catalog(self) -> dict[str, Any]: ...
+
 
 class FreellmpoolProxySupervisor:
     """Own a FreeLLMPool 0.13.0 proxy and expose sanitized loaded IDs only."""
@@ -84,6 +86,28 @@ class FreellmpoolProxySupervisor:
         if server is not None:
             server.shutdown()
             server.server_close()
+
+    def production_catalog(self) -> dict[str, Any]:
+        """Snapshot enabled models from the loaded pool, never from config files."""
+        from .client_config import PROXY_AUTH_ENV, validate_production_catalog
+        from .pool_control import FreellmpoolProbeRunner
+
+        FreellmpoolProbeRunner().check_version()
+        server = self._server
+        thread = self._thread
+        if server is None or thread is None or not thread.is_alive() or not self.proxy_key:
+            raise _control_error("production_catalog_unavailable")
+        rows = [{"provider_id": provider.id,
+                 "model_ids": sorted(f"{provider.id}/{model.name}" for model in provider.models if model.enabled)}
+                for provider in server.pool.providers]
+        host, port = server.server_address[:2]
+        result = validate_production_catalog({
+            "freellmpool_version": "0.13.0", "proxy_base_url": f"http://{host}:{port}/v1",
+            "proxy_auth_env": PROXY_AUTH_ENV, "providers": rows,
+        })
+        if server is not self._server or not thread.is_alive():
+            raise _control_error("production_catalog_unavailable")
+        return result
 
     def running_provider_ids(self) -> set[str]:
         server = self._server

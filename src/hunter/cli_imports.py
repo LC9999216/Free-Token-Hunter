@@ -148,8 +148,8 @@ def _handle_client_config_write(args) -> int:  # noqa: ANN001
     import json
     from pathlib import Path
 
-    from .client_config import write_client_configs
-    from .pool_api import PoolControlClient
+    from .client_config import ClientConfigError, write_client_configs
+    from .pool_api import PoolApiError, PoolControlClient
     from .runtime.store import RuntimeStore
 
     data_dir = _resolve_data_dir(args)
@@ -159,15 +159,20 @@ def _handle_client_config_write(args) -> int:  # noqa: ANN001
     store = RuntimeStore(data_dir / "runtime_providers.json", data_dir / "runtime_history.jsonl")
     providers = store.list_providers()
 
-    # Optional Pool Control readback for confirmed production IDs
-    confirmed_production_ids = None
+    # Production config has no runtime-only or disk-catalog fallback.
     base_url = os.environ.get("HUNTER_POOL_CONTROL_URL", "")
     token = os.environ.get("HUNTER_POOL_CONTROL_TOKEN", "")
-    if base_url and token:
+    if not base_url or not token:
+        print(json.dumps({"error": "pool_control_not_configured"}))
+        return 2
+    try:
         pc = PoolControlClient(base_url, token)
-        confirmed_production_ids = pc.list_production()
-
-    outputs = write_client_configs(output_dir, providers, confirmed_production_ids)
+        catalog = pc.production_catalog()
+        outputs = write_client_configs(output_dir, providers, catalog)
+    except (PoolApiError, ClientConfigError, OSError, ValueError):
+        # Never reflect arbitrary remote errors, paths, or credential values.
+        print(json.dumps({"error": "client_config_readback_or_write_failed"}))
+        return 1
     summary = {k: str(v) for k, v in outputs.items()}
     print(json.dumps(summary, indent=2))
     return 0

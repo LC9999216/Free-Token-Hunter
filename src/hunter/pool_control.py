@@ -478,6 +478,18 @@ class PoolControl:
             production_halted=self._production_halted,
         )
 
+    def production_catalog(self) -> Dict[str, Any]:
+        """Strict live readback for client configs; unlike list_production, no disk fallback."""
+        from .client_config import validate_production_catalog
+
+        if self._production_halted or self._proxy_supervisor is None:
+            raise PoolControlError("production_catalog_unavailable")
+        try:
+            FreellmpoolProbeRunner().check_version()
+            return validate_production_catalog(self._proxy_supervisor.production_catalog())
+        except Exception:
+            raise PoolControlError("production_catalog_unavailable") from None
+
     def list_production(self) -> List[str]:
         """Provider ids loaded by the live proxy, or TOML for test-only use."""
         if self._proxy_supervisor is not None:

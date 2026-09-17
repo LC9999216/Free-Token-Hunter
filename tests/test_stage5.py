@@ -165,17 +165,24 @@ def _production_rp(provider_id: str = "acme", **kw) -> RuntimeProvider:
     )
 
 
+def _catalog(*ids):
+    """Explicit OFFLINE loaded-catalog fixture; never a runtime-only fallback."""
+    return {"freellmpool_version": "0.13.0", "proxy_base_url": "http://127.0.0.1:8080/v1",
+            "proxy_auth_env": "FREELLMPOOL_PROXY_KEY",
+            "providers": [{"provider_id": pid, "model_ids": [f"{pid}/fixture-model"]} for pid in ids]}
+
+
 # --- Codex (TOML, responses wire API) ---------------------------------------
 
 
 def test_codex_config_real_toml_format() -> None:
-    text = generate_codex_config([_production_rp("acme")])
+    text = generate_codex_config([_production_rp("acme")], _catalog("acme"))
     import tomllib
 
     parsed = tomllib.loads(text)
-    entry = parsed["model_providers"]["acme"]
+    entry = parsed["model_providers"]["freellmpool"]
     assert entry["wire_api"] == "responses"
-    assert entry["base_url"].endswith("/acme/responses")
+    assert entry["base_url"] == "http://127.0.0.1:8080/v1"
     assert entry["env_key"]  # env var NAME, not a value
     assert not entry["env_key"].startswith("sk-")
 
@@ -183,19 +190,19 @@ def test_codex_config_real_toml_format() -> None:
 def test_codex_requires_responses_streaming_tools() -> None:
     """Plan §7.3: Codex admission requires Responses + Streaming + Tools."""
     pr = ProtocolResult(chat="pass", responses="pass", streaming="pass", tools="fail")
-    text = generate_codex_config([_production_rp("acme", protocol_result=pr)])
+    text = generate_codex_config([_production_rp("acme", protocol_result=pr)], _catalog("acme"))
     import tomllib
 
-    assert "acme" not in tomllib.loads(text).get("model_providers", {})
+    assert tomllib.loads(text).get("model_providers", {}) == {}
 
 
 def test_codex_provider_name_injection_is_escaped() -> None:
     evil = 'Acme"]\n[injected]\nwire_api = "chat"'
-    text = generate_codex_config([_production_rp("acme", provider_name=evil)])
+    text = generate_codex_config([_production_rp("acme", provider_name=evil)], _catalog("acme"))
     import tomllib
 
     parsed = tomllib.loads(text)
-    assert list(parsed["model_providers"].keys()) == ["acme"]
+    assert list(parsed["model_providers"].keys()) == ["freellmpool"]
     assert "injected" not in parsed
 
 
@@ -203,26 +210,25 @@ def test_codex_provider_name_injection_is_escaped() -> None:
 
 
 def test_opencode_config_real_json_format() -> None:
-    text = generate_opencode_config([_production_rp("acme"), _production_rp("beta")])
+    text = generate_opencode_config([_production_rp("acme"), _production_rp("beta")], _catalog("acme", "beta"))
     parsed = json.loads(text)
-    assert "acme" in parsed["provider"]
-    assert "beta" in parsed["provider"]
-    assert parsed["provider"]["acme"]["options"]["baseURL"].endswith("/acme")
+    assert set(parsed["provider"]["freellmpool"]["models"]) == {"acme/fixture-model", "beta/fixture-model"}
+    assert parsed["provider"]["freellmpool"]["options"]["baseURL"] == "http://127.0.0.1:8080/v1"
 
 
 def test_opencode_config_skips_non_production() -> None:
     staging = RuntimeProvider(
         provider_id="staging-only", actual_pool_status=ActualPoolStatus.STAGING
     )
-    text = generate_opencode_config([_production_rp("prod"), staging])
+    text = generate_opencode_config([_production_rp("prod"), staging], _catalog("prod", "staging-only"))
     parsed = json.loads(text)
-    assert "prod" in parsed["provider"]
-    assert "staging-only" not in parsed["provider"]
+    assert set(parsed["provider"]["freellmpool"]["models"]) == {"prod/fixture-model"}
+    assert "staging-only" not in text
 
 
 def test_opencode_requires_chat() -> None:
     pr = ProtocolResult(chat="fail", responses="pass", streaming="pass", tools="pass")
-    text = generate_opencode_config([_production_rp("acme", protocol_result=pr)])
+    text = generate_opencode_config([_production_rp("acme", protocol_result=pr)], _catalog("acme"))
     assert "acme" not in json.loads(text)["provider"]
 
 
@@ -230,11 +236,11 @@ def test_opencode_respects_pool_readback() -> None:
     """Only providers confirmed in the production pool readback are emitted."""
     text = generate_opencode_config(
         [_production_rp("acme"), _production_rp("ghost")],
-        confirmed_production_ids=["acme"],
+        production_catalog=_catalog("acme"),
     )
-    provider = json.loads(text)["provider"]
-    assert "acme" in provider
-    assert "ghost" not in provider
+    models = json.loads(text)["provider"]["freellmpool"]["models"]
+    assert set(models) == {"acme/fixture-model"}
+    assert "ghost" not in text
 
 
 def test_codex_respects_pool_readback() -> None:
@@ -242,7 +248,7 @@ def test_codex_respects_pool_readback() -> None:
 
     text = generate_codex_config(
         [_production_rp("acme"), _production_rp("ghost")],
-        confirmed_production_ids=[],
+        production_catalog=_catalog(),
     )
     assert tomllib.loads(text).get("model_providers", {}) == {}
 
@@ -251,25 +257,27 @@ def test_codex_respects_pool_readback() -> None:
 
 
 def test_agent_config_yaml_round_trips() -> None:
-    text = generate_agent_config([_production_rp("acme")])
+    text = generate_agent_config([_production_rp("acme")], _catalog("acme"))
     parsed = yaml.safe_load(text)
     entry = parsed["providers"][0]
-    assert entry["endpoint"].endswith("/acme")
+    assert entry["endpoint"] == "http://127.0.0.1:8080/v1"
     assert "auth_env" in entry  # NAME only
 
 
-def test_agent_config_capabilities_reflect_protocol() -> None:
+def test_agent_chat_admission_does_not_invent_model_capabilities() -> None:
     pr = ProtocolResult(chat="pass", responses="pass", streaming="unchecked", tools="pass")
-    text = generate_agent_config([_production_rp("acme", protocol_result=pr)])
+    text = generate_agent_config([_production_rp("acme", protocol_result=pr)], _catalog("acme"))
     entry = yaml.safe_load(text)["providers"][0]
-    assert set(entry["capabilities"]) == {"chat", "responses", "tools"}
+    assert entry["models"] == ["acme/fixture-model"]
+    assert "capabilities" not in entry
 
 
 def test_agent_name_with_yaml_metacharacters_is_safe() -> None:
     evil = 'Acme: [inject]\n  key: value'
-    text = generate_agent_config([_production_rp("acme", provider_name=evil)])
+    text = generate_agent_config([_production_rp("acme", provider_name=evil)], _catalog("acme"))
     parsed = yaml.safe_load(text)
-    assert parsed["providers"][0]["name"] == evil  # round-trips EXACTLY
+    assert parsed["providers"][0]["name"] == "FreeLLMPool"
+    assert evil not in text  # upstream display strings are not copied into proxy configuration
 
 
 # --- secrets & writer -----------------------------------------------------------
@@ -277,7 +285,7 @@ def test_agent_name_with_yaml_metacharacters_is_safe() -> None:
 
 def test_config_no_secret_key_in_output() -> None:
     for generator in (generate_opencode_config, generate_codex_config, generate_agent_config):
-        text = generator([_production_rp("acme")])
+        text = generator([_production_rp("acme")], _catalog("acme"))
         assert "api_key" not in text
         assert "sk-" not in text
         assert "Bearer " not in text
@@ -285,7 +293,7 @@ def test_config_no_secret_key_in_output() -> None:
 
 def test_write_client_configs_creates_validated_files(tmp_path: Path) -> None:
     outputs = write_client_configs(
-        tmp_path / "clients", [_production_rp("acme")], confirmed_production_ids=["acme"]
+        tmp_path / "clients", [_production_rp("acme")], production_catalog=_catalog("acme")
     )
     assert outputs["codex"].is_file()
     assert outputs["opencode"].is_file()
@@ -295,6 +303,6 @@ def test_write_client_configs_creates_validated_files(tmp_path: Path) -> None:
 
 
 def test_empty_list_produces_valid_configs() -> None:
-    assert generate_codex_config([]).strip() != ""
-    assert generate_opencode_config([]).strip() != ""
-    assert generate_agent_config([]).strip() != ""
+    assert generate_codex_config([], _catalog()).strip() != ""
+    assert generate_opencode_config([], _catalog()).strip() != ""
+    assert generate_agent_config([], _catalog()).strip() != ""
