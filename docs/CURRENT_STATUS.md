@@ -39,20 +39,20 @@ performed while producing this status.
 
 ## Remaining live gates
 
-1. Harden the existing external live-state ACL before entering any key. The read-only inspection of
-   `D:\AI\Free token\Free Token Hunter-stage2-live-state` found inherited ACLs with
-   `Authenticated Users: Modify` on the root and `pool\production`; this fails the secret-directory
-   gate. Applying ACL changes requires explicit user authorization.
-2. Run evidence collection from a host whose DNS returns public provider addresses. The current
+The external live-state ACL gate passed after explicit approval: the root now grants inheritable
+full control only to the current user, SYSTEM, and Administrators. The project verification command
+reported no permission errors, missing files, or hash mismatches.
+
+1. Run evidence collection from a host whose DNS returns public provider addresses. The current
    Codex host resolves `developers.cloudflare.com` to reserved address `198.18.0.104`, so
    `SafeFetcher` correctly refuses the connection. Do not weaken SSRF validation to bypass this.
-3. Configure a real JSON-capable OpenAI-compatible extraction model through process environment
+2. Configure a real JSON-capable OpenAI-compatible extraction model through process environment
    variables and run Stage 1 against an external data copy with `--require-llm`.
-4. Stop unless Stage 1 legitimately produces at least one anchored, grounded `FREE_CONFIRMED`
+3. Stop unless Stage 1 legitimately produces at least one anchored, grounded `FREE_CONFIRMED`
    provider. Never edit Registry status or Evidence by hand.
-5. Obtain explicit authorization for that provider's API key, enter it through Pool Control
+4. Obtain explicit authorization for that provider's API key, enter it through Pool Control
    `getpass`, and then execute staging health plus chat, responses, streaming, and tools canaries.
-6. Complete approval binding, promotion readback, Codex/OpenCode/client interoperability,
+5. Complete approval binding, promotion readback, Codex/OpenCode/client interoperability,
    downgrade/suspension, and Feishu delivery gates in order.
 
 The project is offline release-ready, but it is not live-validated or production-ready until these
