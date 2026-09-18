@@ -14,6 +14,7 @@ new no-op History events. The default missing extractor fails closed.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -67,6 +68,24 @@ class Pipeline:
             history_path=self.data_dir / "history.jsonl",
         )
         anchors = load_trust_anchors(self.sources_path)
+        sources_config = load_sources(self.sources_path)
+        reviewed = sources_config.get("reviewed_evidence") or {}
+        self.reviewed_evidence: Dict[str, List[Dict[str, str]]] = {}
+        if isinstance(reviewed, dict):
+            for provider_id, entries in reviewed.items():
+                if not isinstance(entries, list):
+                    continue
+                normalized: List[Dict[str, str]] = []
+                for entry in entries:
+                    if isinstance(entry, str):
+                        normalized.append({"url": entry, "source_type": ""})
+                    elif isinstance(entry, dict) and isinstance(entry.get("url"), str):
+                        source_type = str(entry.get("source_type") or "")
+                        if source_type not in {"", "pricing", "api-docs", "docs", "blog", "github"}:
+                            continue
+                        normalized.append({"url": entry["url"], "source_type": source_type})
+                if normalized:
+                    self.reviewed_evidence[str(provider_id)] = normalized
         self.validator = OfficialEvidenceValidator(anchors=anchors)
         self.scoring_config = load_scoring_config(self.scoring_path)
         self.resolver = resolver or EvidenceResolver()
@@ -100,10 +119,16 @@ class Pipeline:
         created = 0
         for candidate in self.candidate_store.list_candidates():
             observations = [obs.model_dump(mode="json") for obs in candidate.observations]
-            urls = self.resolver.propose_urls(
-                candidate_domain=candidate.canonical_domain_hint,
-                observations=observations,
-            )
+            reviewed_entries = self.reviewed_evidence.get(candidate.candidate_id, [])
+            reviewed_types = {
+                entry["url"]: entry["source_type"] for entry in reviewed_entries
+            }
+            urls = [entry["url"] for entry in reviewed_entries]
+            if not reviewed_entries:
+                urls = self.resolver.propose_urls(
+                    candidate_domain=candidate.canonical_domain_hint,
+                    observations=observations,
+                )
             for url in urls:
                 try:
                     result = self.fetcher.fetch(url, provider_id=candidate.candidate_id)
@@ -118,7 +143,7 @@ class Pipeline:
                     evidence = Evidence.from_fetch(
                         result,
                         provider_id=candidate.candidate_id,
-                        source_type=_guess_source_type(result.final_url or url),
+                        source_type=(reviewed_types.get(url) or _guess_source_type(result.final_url or url)),
                         excerpt_length=4000,
                         retrieved_at=self.as_of,
                         candidate_id=candidate.candidate_id,
@@ -188,6 +213,7 @@ class Pipeline:
             "providers_updated": 0,
             "unchanged": 0,
             "errors": 0,
+            "candidate_outcomes": [],
         }
         for candidate in self.candidate_store.list_candidates():
             try:
@@ -201,11 +227,38 @@ class Pipeline:
                     continue
                 winner = self._resolved_evidence.get(candidate.candidate_id)
                 if winner is None or candidate.candidate_id in self._unresolved_contradictions:
+                    reasons = self._unresolved_contradictions.get(candidate.candidate_id)
+                    outcomes["candidate_outcomes"].append(
+                        {
+                            "candidate_id": candidate.candidate_id,
+                            "outcome": (
+                                "unresolved_contradiction"
+                                if reasons
+                                else "no_resolved_evidence"
+                            ),
+                            "reason": "; ".join(reasons or ["no evidence winner"]),
+                        }
+                    )
                     outcomes["unchanged"] += 1
                     continue
                 extraction = self._extraction_for(candidate.candidate_id)
                 if extraction is None or not extraction.ok:
                     # ungrounded extraction: recorded, retryable, not confirmed
+                    outcomes["candidate_outcomes"].append(
+                        {
+                            "candidate_id": candidate.candidate_id,
+                            "outcome": (
+                                "extractor_unavailable"
+                                if extraction is None
+                                else "extraction_failed"
+                            ),
+                            "reason": (
+                                "real grounded extractor is not configured"
+                                if extraction is None
+                                else extraction.failure_reason or "unspecified"
+                            ),
+                        }
+                    )
                     outcomes["unchanged"] += 1
                     continue
                 provider_id = _slug(candidate.provider_name or candidate.candidate_id)
@@ -249,11 +302,25 @@ class Pipeline:
                     self.registry,
                     self.validator,
                 )
-            except ConfirmationError:
+            except ConfirmationError as exc:
                 # a hard gate rejected this candidate; nothing was mutated
+                outcomes["candidate_outcomes"].append(
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "outcome": "confirmation_rejected",
+                        "reason": str(exc),
+                    }
+                )
                 outcomes["unchanged"] += 1
                 continue
-            except Exception:  # noqa: BLE001 - one candidate must not corrupt others
+            except Exception as exc:  # noqa: BLE001 - isolate and report safely
+                outcomes["candidate_outcomes"].append(
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "outcome": "processing_error",
+                        "reason": _sanitized_exception(exc),
+                    }
+                )
                 outcomes["errors"] += 1
                 continue
 
@@ -306,6 +373,7 @@ class Pipeline:
                 "validation": validation,
                 "contradictions": contradictions,
                 "providers": len(self.registry.list_providers()),
+                "candidate_outcomes": outcomes["candidate_outcomes"],
             },
         }
 
@@ -319,6 +387,14 @@ def _status_key(status) -> str:
         "EXPIRED": "expired",
         "REJECTED": "rejected",
     }.get(value, "uncertain")
+
+
+def _sanitized_exception(exc: Exception) -> str:
+    """Return bounded diagnostic text without common credential forms."""
+    message = " ".join(str(exc).split())
+    message = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", message)
+    message = re.sub(r"(?i)\bbearer\s+\S+", "Bearer [REDACTED]", message)
+    return f"{type(exc).__name__}: {message}"[:500]
 
 
 def _slug(name: str) -> str:

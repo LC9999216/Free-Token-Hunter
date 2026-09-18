@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -23,6 +24,105 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..discovery.models import _require_aware_iso
+
+
+class _VisibleTextParser(HTMLParser):
+    """Collect visible HTML text while excluding executable and style data."""
+
+    _HIDDEN_TAGS = {"script", "style", "noscript", "template"}
+    _CHROME_TAGS = {"header", "nav", "footer", "aside"}
+    _MAIN_TAGS = {"main", "article"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._hidden_depth = 0
+        self._chrome_depth = 0
+        self._main_depth = 0
+        self.metadata_parts: List[str] = []
+        self.main_parts: List[str] = []
+        self.parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[tuple[str, Optional[str]]]) -> None:
+        normalized_tag = tag.lower()
+        if normalized_tag == "meta":
+            attributes = {key.lower(): value for key, value in attrs if value is not None}
+            descriptor = (attributes.get("name") or attributes.get("property") or "").lower()
+            content = attributes.get("content", "").strip()
+            if descriptor in {"description", "og:description", "twitter:description"} and content:
+                if content not in self.metadata_parts:
+                    self.metadata_parts.append(content)
+        if normalized_tag in self._HIDDEN_TAGS:
+            self._hidden_depth += 1
+        if normalized_tag in self._CHROME_TAGS:
+            self._chrome_depth += 1
+        if normalized_tag in self._MAIN_TAGS:
+            self._main_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized_tag = tag.lower()
+        if normalized_tag in self._HIDDEN_TAGS and self._hidden_depth:
+            self._hidden_depth -= 1
+        if normalized_tag in self._CHROME_TAGS and self._chrome_depth:
+            self._chrome_depth -= 1
+        if normalized_tag in self._MAIN_TAGS and self._main_depth:
+            self._main_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._hidden_depth or self._chrome_depth or not data.strip():
+            return
+        if self._main_depth:
+            self.main_parts.append(data)
+        else:
+            self.parts.append(data)
+
+
+def _evidence_text(body_text: str, headers: Any) -> str:
+    """Return normalized visible text for HTML, otherwise decoded body text."""
+    content_type = ""
+    if hasattr(headers, "items"):
+        content_type = next(
+            (str(value) for key, value in headers.items() if str(key).lower() == "content-type"),
+            "",
+        ).lower()
+    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+        return body_text
+
+    parser = _VisibleTextParser()
+    parser.feed(body_text)
+    parser.close()
+    ordered_parts = parser.metadata_parts + parser.main_parts + parser.parts
+    return " ".join(" ".join(ordered_parts).split())
+
+
+_FREE_OFFER_MARKERS = re.compile(
+    r"(?i)\bfree\s+(?:tier|credit|credits|account|accounts)\b"
+    r"|\bfor\s+free\b|\bno[- ]cost\b|\bnot\s+free\b|\btrial\b"
+    r"|[$€£]\s?\d+(?:\.\d+)?"
+)
+
+
+def _bounded_evidence_excerpt(text: str, excerpt_length: int) -> str:
+    """Keep explicit free-offer sentences when the normalized page is long."""
+    limit = max(0, int(excerpt_length))
+    if len(text) <= limit:
+        return text
+    if limit == 0:
+        return ""
+
+    spans: List[tuple[int, int]] = []
+    for match in _FREE_OFFER_MARKERS.finditer(text):
+        start = max(text.rfind(".", 0, match.start()), text.rfind("!", 0, match.start()), text.rfind("?", 0, match.start())) + 1
+        while start < len(text) and text[start].isspace():
+            start += 1
+        endings = [pos for pos in (text.find(".", match.end()), text.find("!", match.end()), text.find("?", match.end())) if pos >= 0]
+        end = (min(endings) + 1) if endings else min(len(text), match.end() + 240)
+        if not spans or (start, end) != spans[-1]:
+            spans.append((start, end))
+
+    if not spans:
+        return text[:limit]
+    relevant = " ".join(text[start:end].strip() for start, end in spans if end > start)
+    return relevant[:limit]
 
 
 class Officiality(str, enum.Enum):
@@ -138,8 +238,9 @@ class Evidence(BaseModel):
         BOUND to the actually-fetched body (review round 2):
 
         - the fetch must have returned a 2xx (non-2xx fails closed);
-        - ``content_excerpt`` is derived by truncating the decoded body —
-          caller-supplied excerpt text is never trusted;
+        - ``content_excerpt`` is derived from the decoded body; HTML is reduced
+          to normalized visible text before truncation so CSS/script shells do
+          not displace the actual evidence;
         - ``claim``, when provided, must be a substring of the fetched body
           so a fabricated claim cannot ride on a real fetch;
         - ``provenance.content_sha256`` is recomputed from the body bytes,
@@ -157,7 +258,8 @@ class Evidence(BaseModel):
         if claim is not None and claim not in body_text:
             raise ValueError("claim is not present in the fetched content")
         sha256 = hashlib.sha256(bytes(body)).hexdigest()
-        excerpt = body_text[: max(0, int(excerpt_length))]
+        evidence_text = _evidence_text(body_text, getattr(fetch_result, "headers", {}))
+        excerpt = _bounded_evidence_excerpt(evidence_text, excerpt_length)
         final_url = fetch_result.final_url or fetch_result.original_url
         provenance = EvidenceProvenance(
             retrieval_method="safe_fetch",

@@ -191,6 +191,46 @@ def test_run_stage_one_wires_configured_runtime_extractor(monkeypatch, tmp_path:
     assert observed["extractor"] is sentinel
 
 
+def test_run_stage_one_prints_sanitized_candidate_outcomes(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    import hunter.llm.runtime as llm_runtime
+    import hunter.pipeline as pipeline_module
+
+    class FakePipeline:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self):
+            return {
+                "detail": {
+                    "candidate_outcomes": [
+                        {
+                            "candidate_id": "acme",
+                            "outcome": "extraction_failed",
+                            "reason": "grounding mismatch",
+                        }
+                    ]
+                }
+            }
+
+    monkeypatch.setattr(llm_runtime, "build_grounded_extractor_from_env", lambda: object())
+    monkeypatch.setattr(pipeline_module, "Pipeline", FakePipeline)
+
+    assert cli.main(["run-stage-one", "--data-dir", str(tmp_path)]) == 0
+
+    line = next(
+        item
+        for item in capsys.readouterr().out.splitlines()
+        if item.startswith("candidate_outcome=")
+    )
+    assert json.loads(line.removeprefix("candidate_outcome=")) == {
+        "candidate_id": "acme",
+        "outcome": "extraction_failed",
+        "reason": "grounding mismatch",
+    }
+
+
 def test_run_stage_one_reports_invalid_llm_configuration(monkeypatch, tmp_path: Path, capsys) -> None:
     import hunter.llm.runtime as llm_runtime
     from hunter.llm.client import LlmConfigurationError

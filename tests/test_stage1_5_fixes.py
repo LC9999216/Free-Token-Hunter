@@ -227,6 +227,117 @@ def test_from_fetch_binds_excerpt_to_actual_body() -> None:
     assert ev.content_excerpt in body.decode("utf-8")
 
 
+def test_from_fetch_extracts_visible_html_before_truncating() -> None:
+    """Long CSS/script shells must not displace the actual offer text."""
+    body = (
+        "<html><head><style>" + (".font{color:red}" * 500) + "</style>"
+        "<script>ignore_me = 'not visible';</script></head>"
+        "<body><h1>Free tier</h1><p>Programmatic API access is included.</p></body></html>"
+    ).encode("utf-8")
+    result = FetchResult(
+        status=200,
+        headers={"content-type": "text/html; charset=utf-8"},
+        body=body,
+        final_url="https://acme.ai/pricing",
+        original_url="https://acme.ai/pricing",
+        content_sha256=__import__("hashlib").sha256(body).hexdigest(),
+        retrieved_at=datetime.now(timezone.utc),
+    )
+
+    ev = Evidence.from_fetch(
+        result,
+        provider_id="acme",
+        source_type="pricing",
+        excerpt_length=120,
+    )
+
+    assert ev.content_excerpt == "Free tier Programmatic API access is included."
+    assert ".font" not in ev.content_excerpt
+    assert "ignore_me" not in ev.content_excerpt
+
+
+def test_from_fetch_prioritizes_official_html_description_metadata() -> None:
+    """A bounded excerpt keeps the page's offer summary ahead of repeated nav text."""
+    body = (
+        '<html><head><meta name="description" '
+        'content="Try our programmatic API for free."></head>'
+        '<body><nav>' + ("Products Developers Resources " * 100) + '</nav>'
+        '<main>Pricing details</main></body></html>'
+    ).encode("utf-8")
+    result = FetchResult(
+        status=200,
+        headers={"content-type": "text/html"},
+        body=body,
+        final_url="https://acme.ai/pricing",
+        original_url="https://acme.ai/pricing",
+        content_sha256=__import__("hashlib").sha256(body).hexdigest(),
+        retrieved_at=datetime.now(timezone.utc),
+    )
+
+    ev = Evidence.from_fetch(
+        result,
+        provider_id="acme",
+        source_type="pricing",
+        excerpt_length=120,
+    )
+
+    assert ev.content_excerpt.startswith("Try our programmatic API for free.")
+
+
+def test_from_fetch_prioritizes_main_content_over_navigation() -> None:
+    """Pricing facts in main content survive a bounded excerpt after large site chrome."""
+    body = (
+        '<html><body><header><nav>'
+        + ("Products Developers Resources " * 100)
+        + '</nav></header><main><h1>Free</h1>'
+        '<p>New accounts receive $50 in one-time credits for API access.</p>'
+        '</main><footer>' + ("Company Legal " * 100) + '</footer></body></html>'
+    ).encode("utf-8")
+    result = FetchResult(
+        status=200,
+        headers={"content-type": "text/html"},
+        body=body,
+        final_url="https://acme.ai/pricing",
+        original_url="https://acme.ai/pricing",
+        content_sha256=__import__("hashlib").sha256(body).hexdigest(),
+        retrieved_at=datetime.now(timezone.utc),
+    )
+
+    ev = Evidence.from_fetch(
+        result,
+        provider_id="acme",
+        source_type="pricing",
+        excerpt_length=120,
+    )
+
+    assert ev.content_excerpt == "Free New accounts receive $50 in one-time credits for API access."
+
+
+def test_from_fetch_keeps_relevant_free_credit_section_late_in_long_page() -> None:
+    """A late official free-credit section must survive the bounded excerpt."""
+    body = (
+        "<html><body><main><p>" + ("Account management details. " * 300) + "</p>"
+        "<h2>Free tier and credits</h2>"
+        "<p>New accounts receive $50 in one-time free credits for API access.</p>"
+        "</main></body></html>"
+    ).encode("utf-8")
+    result = FetchResult(
+        status=200,
+        headers={"content-type": "text/html"},
+        body=body,
+        final_url="https://acme.ai/docs/account",
+        original_url="https://acme.ai/docs/account",
+        content_sha256=__import__("hashlib").sha256(body).hexdigest(),
+        retrieved_at=datetime.now(timezone.utc),
+    )
+
+    ev = Evidence.from_fetch(result, provider_id="acme", excerpt_length=180)
+
+    assert len(ev.content_excerpt or "") <= 180
+    assert "Free tier and credits" in (ev.content_excerpt or "")
+    assert "$50 in one-time free credits for API access" in (ev.content_excerpt or "")
+
+
 def test_from_fetch_rejects_forged_excerpt() -> None:
     """A caller-supplied excerpt that is not part of the body fails closed."""
     body = b"real fetched page content"

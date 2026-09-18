@@ -22,6 +22,7 @@ from hunter.llm.extractor import (
     validate_grounding,
 )
 from hunter.llm.models import ExtractionResult, GroundedField
+from hunter.llm.prompts import build_extraction_prompt, build_repair_prompt
 
 PRICING_TEXT = (
     "We offer a free tier with 100,000 tokens per month. "
@@ -29,6 +30,30 @@ PRICING_TEXT = (
     "The API is OpenAI-compatible. "
     "This plan renews monthly."
 )
+
+
+def test_extraction_prompt_limits_models_to_explicit_free_offer_list() -> None:
+    prompt = build_extraction_prompt("ev-1", PRICING_TEXT)
+
+    assert "models" in prompt
+    assert "included in the free offer" in prompt
+
+
+def test_extraction_prompt_defines_offer_kind_and_quota_mappings() -> None:
+    prompt = build_extraction_prompt("ev-1", PRICING_TEXT)
+
+    assert "trial_credit" in prompt
+    assert "offer_kind=trial" in prompt
+    assert "signup_credit" in prompt
+    assert "offer_kind=free_credit" in prompt
+    assert "quota_mode=one_time" in prompt
+
+
+def test_repair_prompt_requires_omitting_fields_with_unfixable_offsets() -> None:
+    prompt = build_repair_prompt("ev-1", PRICING_TEXT, "models offsets mismatch")
+
+    assert "omit that field" in prompt
+    assert "never repeat an invalid field" in prompt
 
 
 def _evidence(evidence_id: str = "ev-1", text: str = PRICING_TEXT) -> Evidence:

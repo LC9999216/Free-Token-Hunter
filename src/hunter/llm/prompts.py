@@ -99,6 +99,15 @@ def build_extraction_prompt(evidence_id: str, evidence_text: str) -> str:
         "for enum fields, or {"
         '"evidence_id", "quote", "start_offset", "end_offset"} for other fields, '
         "pointing exactly into the EVIDENCE TEXT below (models is a list of such objects). "
+        "Only return models when the evidence explicitly identifies them as included in the free offer; "
+        "do not return paid models or a general pricing catalog. "
+        "Normalize offer facts with these fixed mappings: signup_credit means "
+        "offer_kind=free_credit and quota_mode=one_time; trial_credit, or an explicit "
+        "limited trial whose credits are exhausted, means offer_kind=trial and "
+        "quota_mode=one_time; permanent or renewing free access means "
+        "offer_kind=free_tier with quota_mode=unmetered or renewing as supported; "
+        "a promotion requires an explicit expiry. When evidence explicitly says limited "
+        "trial and also uses the label free tier, use offer_kind=trial. "
         "You must not decide source officiality, contradictions, confidence "
         "scores, or provider state.\n"
         "EVIDENCE ID: " + evidence_id + "\n"
@@ -113,7 +122,8 @@ def build_repair_prompt(evidence_id: str, evidence_text: str, problem: str) -> s
         build_extraction_prompt(evidence_id, evidence_text)
         + "\nPrevious output was invalid: "
         + problem
-        + ". Fix it and return only valid grounded JSON."
+        + ". Fix it and return only valid grounded JSON. If an exact quote and offsets "
+        "cannot be verified for a field, omit that field; never repeat an invalid field."
     )
 
 

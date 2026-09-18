@@ -8,6 +8,7 @@ tasks. Unknown commands fail with a non-zero exit code.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -334,6 +335,11 @@ def _handle_pipeline(args: argparse.Namespace) -> int:
     if detail:
         print(f"evidence_built={detail.get('evidence_built', 0)}")
         print(f"providers={detail.get('providers', 0)}")
+        for outcome in detail.get("candidate_outcomes", []):
+            print(
+                "candidate_outcome="
+                + json.dumps(outcome, sort_keys=True, separators=(",", ":"))
+            )
     return 0
 
 
