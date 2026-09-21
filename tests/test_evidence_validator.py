@@ -534,3 +534,47 @@ def test_error_shell_rule_only_applies_to_anchored_domains() -> None:
     )
     validated = _validator().validate(ev)
     assert validated.officiality is Officiality.THIRD_PARTY
+
+
+# --- same-URL snapshots are one source at decision time ----------------------
+
+
+def test_same_url_snapshots_do_not_conflict() -> None:
+    older = _evidence(
+        "https://acme.ai/pricing",
+        officiality=Officiality.OFFICIAL,
+        evidence_id="ev-a",
+        claim="Pricing | Acme free plan",
+        content_excerpt="A" * 500,
+        retrieved_at="2026-09-21T06:00:00+00:00",
+    )
+    newer = _evidence(
+        "https://acme.ai/pricing",
+        officiality=Officiality.OFFICIAL,
+        evidence_id="ev-b",
+        claim="Pricing | Acme free plan",
+        content_excerpt="B" * 900,
+        retrieved_at="2026-09-21T07:00:00+00:00",
+    )
+    result = _validator().resolve_contradictions([older, newer])
+    assert result["winner"].evidence_id == "ev-b"
+    assert result["unresolved"] == []
+
+
+def test_distinct_urls_same_priority_still_conflict() -> None:
+    first = _evidence(
+        "https://acme.ai/pricing",
+        officiality=Officiality.OFFICIAL,
+        evidence_id="ev-a",
+        claim="Pricing | Acme free plan",
+        content_excerpt="A" * 500,
+    )
+    second = _evidence(
+        "https://acme.ai/pricing-plans",
+        officiality=Officiality.OFFICIAL,
+        evidence_id="ev-c",
+        claim="Plans and pricing | Acme enterprise",
+        content_excerpt="C" * 500,
+    )
+    result = _validator().resolve_contradictions([first, second])
+    assert result["unresolved"], "genuinely distinct sources without dates must stay blocked"

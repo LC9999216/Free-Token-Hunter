@@ -435,6 +435,25 @@ class OfficialEvidenceValidator:
 
     # --- contradictions ------------------------------------------------------
 
+    @staticmethod
+    def _latest_per_url(evidences: List[Evidence]) -> List[Evidence]:
+        """Collapse same-URL snapshots to the freshest retrieval.
+
+        Evidence IDs are content-addressed, so re-fetching one source URL can
+        append several OFFICIAL snapshots whose text drifted slightly. At
+        decision time they are one source; retrieved_at (freshness only, per
+        spec 8.3) picks which snapshot stands. Ties break by evidence_id.
+        """
+        latest: Dict[str, Evidence] = {}
+        for e in evidences:
+            current = latest.get(e.url)
+            if current is None or (e.retrieved_at, e.evidence_id) > (
+                current.retrieved_at,
+                current.evidence_id,
+            ):
+                latest[e.url] = e
+        return list(latest.values())
+
     def resolve_contradictions(
         self, evidences: List[Evidence], require_dates: bool = False
     ) -> Dict[str, Any]:
@@ -444,6 +463,7 @@ class OfficialEvidenceValidator:
         then ``published_at``. ``retrieved_at`` never acts as the policy date.
         """
         official = [e for e in evidences if e.officiality is Officiality.OFFICIAL]
+        official = self._latest_per_url(official)
         if not official:
             raise ContradictionError("no OFFICIAL evidence supports confirmation")
 
