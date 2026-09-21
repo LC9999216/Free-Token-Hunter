@@ -33,3 +33,6 @@ data/.runtime_txn.json
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local virtualenv
+.venv/
