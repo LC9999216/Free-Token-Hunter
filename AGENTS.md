@@ -554,7 +554,7 @@ All default tests are offline and deterministic. Fixtures must include:
 - registry crash points and journal recovery;
 - score boundaries and fixed `as_of` behavior.
 
-Every task must add or update tests for its behavior. CLI parsing must not contain business logic.
+Every behavior-changing task must add or update a focused test for its behavior. Documentation, formatting, and configuration-only edits use the smallest relevant validation. CLI parsing must not contain business logic.
 
 ---
 
