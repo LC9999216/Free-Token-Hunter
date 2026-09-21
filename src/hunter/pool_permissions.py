@@ -62,10 +62,15 @@ def secure_new_secret_file(path: Path) -> None:
 
 def _verify_nt_acls(path: Path) -> bool:
     import subprocess
+    # icacls emits locale-encoded (e.g. GBK) summary lines after the ACE
+    # list; strict decoding crashes the capture thread and yields no stdout.
     result = subprocess.run(
         ["icacls", str(path)],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=10,
     )
+    if result.stdout is None:
+        return False
     for line in result.stdout.splitlines():
         stripped = line.strip()
         if stripped.startswith("NT AUTHORITY\\Authenticated Users"):
@@ -93,7 +98,8 @@ def _current_sid() -> str:
     import subprocess
     result = subprocess.run(
         ["powershell", "-Command", "(Get-WmiObject Win32_UserAccount -Filter \"Name='$env:USERNAME' AND Domain='$env:USERDOMAIN'\").SID"],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=10,
     )
     sid = result.stdout.strip()
     if sid.startswith("S-1-"):
