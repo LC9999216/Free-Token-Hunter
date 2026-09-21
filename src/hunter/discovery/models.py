@@ -25,6 +25,8 @@ class SourceType(str, enum.Enum):
     github = "github"
     curated_repo = "curated_repo"
     hackernews = "hackernews"
+    reddit = "reddit"
+    x = "x"
     web_search = "web_search"
     manual = "manual"
 

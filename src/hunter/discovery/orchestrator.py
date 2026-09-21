@@ -134,7 +134,10 @@ def _identity_domain(obs: CandidateObservation) -> Optional[str]:
     """Derive a provider identity hint from observation metadata.
 
     Curated observations carry the asserted docs URL; Hacker News items carry
-    the linked provider URL; otherwise fall back to the source URL host.
+    the linked provider URL; social observations (Reddit/X) carry the linked
+    provider URL and never fall back to a social host as the identity hint;
+    otherwise fall back to the source URL host. The hint is never an
+    officiality decision.
     """
     meta = obs.raw_metadata or {}
     if obs.source_type is SourceType.github:
@@ -143,11 +146,11 @@ def _identity_domain(obs: CandidateObservation) -> Optional[str]:
         if domain and domain not in {"github.com", "www.github.com"}:
             return domain
         return None
-    for key in ("asserted_docs_url", "hn_link", "provider_url"):
+    for key in ("asserted_docs_url", "hn_link", "provider_url", "reddit_link"):
         value = meta.get(key)
         if value:
             domain = _domain_from_url(str(value))
-            if domain:
+            if domain and domain not in {"reddit.com", "www.reddit.com", "x.com", "twitter.com"}:
                 return domain
     return _domain_from_url(obs.source_url)
 
