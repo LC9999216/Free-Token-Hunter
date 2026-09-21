@@ -488,3 +488,49 @@ def test_shipped_config_anchors_use_spec_schema() -> None:
     assert match_anchor(groq, "github.com", github_repo="groq/groq") is True
     assert match_anchor(groq, "github.com", github_repo="evil/llm") is False
     assert match_anchor(by_id["huggingface"], "huggingface.co.evil.com") is False
+
+
+# --- TA-008: error-shell pages from anchored domains are not evidence --------
+
+
+def test_error_shell_from_anchored_domain_is_rejected() -> None:
+    ev = _evidence(
+        "https://acme.ai/pricing-plans",
+        officiality=Officiality.OFFICIAL,
+        claim="The author you are looking for could not be found. Author Not Found | Acme",
+        content_excerpt="Author Not Found",
+    )
+    validated = _validator().validate(ev)
+    assert validated.officiality is Officiality.REJECTED
+    assert any(note.startswith("TA-008:") for note in validated.validation_notes)
+
+
+def test_substantial_page_mentioning_404_stays_official() -> None:
+    ev = _evidence(
+        "https://acme.ai/docs/errors",
+        officiality=Officiality.OFFICIAL,
+        claim="Handling 404 not found responses | Acme API docs",
+        content_excerpt="A 404 not found response means the resource does not exist. " * 40,
+    )
+    assert _validator().validate(ev).officiality is Officiality.OFFICIAL
+
+
+def test_normal_pricing_page_stays_official() -> None:
+    ev = _evidence(
+        "https://acme.ai/pricing",
+        officiality=Officiality.OFFICIAL,
+        claim="Pricing | Acme Free Standard Enterprise",
+        content_excerpt="Free plan: 25+ free models with per-model limits. " * 40,
+    )
+    assert _validator().validate(ev).officiality is Officiality.OFFICIAL
+
+
+def test_error_shell_rule_only_applies_to_anchored_domains() -> None:
+    ev = _evidence(
+        "https://unrelated.example.com/pricing",
+        officiality=Officiality.OFFICIAL,
+        claim="Author Not Found",
+        content_excerpt="Author Not Found",
+    )
+    validated = _validator().validate(ev)
+    assert validated.officiality is Officiality.THIRD_PARTY

@@ -36,6 +36,25 @@ RULE_SAME_REGISTRABLE_DOMAIN = "TA-004"
 RULE_NO_ANCHOR_FOR_PROVIDER = "TA-005"
 RULE_NO_MATCH_THIRD_PARTY = "TA-006"
 RULE_UNMAPPED_GITHUB = "TA-007"
+RULE_ERROR_SHELL = "TA-008"
+
+# A soft-404 shell served with HTTP 200 by an anchored domain is not evidence
+# of anything. Detection needs BOTH an explicit not-found marker in the page
+# text AND a near-empty excerpt: a substantial docs page that merely discusses
+# 404 responses must keep its officiality.
+_ERROR_SHELL_MARKERS = (
+    "author not found",
+    "page not found",
+    "404 not found",
+)
+_ERROR_SHELL_MAX_EXCERPT = 256
+
+
+def _is_error_shell(evidence: Evidence) -> bool:
+    text = f"{evidence.claim or ''} {evidence.content_excerpt or ''}".lower()
+    if not any(marker in text for marker in _ERROR_SHELL_MARKERS):
+        return False
+    return len((evidence.content_excerpt or "").strip()) < _ERROR_SHELL_MAX_EXCERPT
 
 # Comparing a shortener cannot establish officiality.
 URL_SHORTENERS = {
@@ -298,6 +317,12 @@ class OfficialEvidenceValidator:
 
         anchor = self._anchor_for(evidence.provider_id, host, repo)
         if anchor is not None:
+            if _is_error_shell(evidence):
+                return ValidationDecision(
+                    officiality=Officiality.REJECTED,
+                    rule_id=RULE_ERROR_SHELL,
+                    note="anchor-matched page is an error shell (soft 404); not valid evidence",
+                )
             if repo is not None and self._github_rule_applies(anchor, repo):
                 if not provenance_ok:
                     return ValidationDecision(
