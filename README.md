@@ -1,5 +1,7 @@
 # Free Token Hunter
 
+Current implementation and live-gate status: [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md).
+
 Free Token Hunter discovers legitimate free AI/LLM API offers, verifies them against current
 first-party evidence, extracts normalized facts, calculates deterministic trust/value scores, and
 writes a local provider registry.
@@ -90,6 +92,22 @@ candidates_processed, providers_created, providers_updated, free_confirmed,
 uncertain, not_free, expired, rejected, unchanged, errors
 ```
 
+For a real Stage 1 run, configure an OpenAI-compatible Chat Completions endpoint through process
+environment variables. The API key is sent only as an HTTP Authorization header and is never put
+in prompts, logs, registry data, or command-line arguments:
+
+```powershell
+$env:HUNTER_LLM_BASE_URL = "https://YOUR-ENDPOINT.example/v1"
+$env:HUNTER_LLM_API_KEY = "YOUR-KEY"
+$env:HUNTER_LLM_MODEL = "YOUR-JSON-CAPABLE-MODEL"
+python -m hunter run-stage-one --require-llm --data-dir "D:\path\to\external-stage1-data"
+```
+
+Use `--require-llm` for unattended or release runs. It exits with code 2 when the real grounded
+extractor is absent or only partially configured, preventing a fail-closed no-op from being
+mistaken for a successful verification run. Keep live data outside the repository and never place
+real values in `.env.example`.
+
 ## Confirmation hard gates
 
 `confirm_provider()` is the only path into `FREE_CONFIRMED`; the generic transition API rejects it.
@@ -119,3 +137,24 @@ faked. The pinned upstream fixture (`tests/fixtures/upstream/free-llm-api-hub-v2
 in the repo so every run is reproducible.
 
 See `CODEX_TASKS_000_010.md` for the authoritative task breakdown.
+
+## Optional Stage 2 Pool Control service
+
+Stage 2 is separate from the Stage 1 confirmation pipeline. Install its exact
+runtime dependency in the isolated Pool Control environment:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,stage2]"
+.\.venv\Scripts\python.exe -c "import freellmpool; assert freellmpool.__version__ == '0.13.0'"
+```
+
+1. Set the named environment variables in the relevant local process
+   environments without recording their values: `HUNTER_POOL_CONTROL_TOKEN`,
+   `HUNTER_POOL_CONTROL_URL`, and `FREELLMPOOL_PROXY_KEY`.
+2. Start `hunter-pool-control serve` in the isolated Pool Control environment.
+3. Run `python -m hunter run-stage-two` in the Hunter environment.
+4. Treat every nonzero exit code as fail-closed and review it before retrying.
+
+The Pool Control service owns the provider TOML files, provider keys, and
+FreeLLMPool proxy; Hunter communicates through `PoolControlClient` only.

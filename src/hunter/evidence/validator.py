@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from .models import Evidence, Officiality
+from .models import Evidence, EvidenceProvenance, Officiality, canonicalize_evidence_url
 
 # Evidence precedence, highest first (AGENTS.md 8.3).
 SOURCE_PRIORITY = ["pricing", "api-docs", "docs", "blog", "github"]
@@ -36,6 +36,25 @@ RULE_SAME_REGISTRABLE_DOMAIN = "TA-004"
 RULE_NO_ANCHOR_FOR_PROVIDER = "TA-005"
 RULE_NO_MATCH_THIRD_PARTY = "TA-006"
 RULE_UNMAPPED_GITHUB = "TA-007"
+RULE_ERROR_SHELL = "TA-008"
+
+# A soft-404 shell served with HTTP 200 by an anchored domain is not evidence
+# of anything. Detection needs BOTH an explicit not-found marker in the page
+# text AND a near-empty excerpt: a substantial docs page that merely discusses
+# 404 responses must keep its officiality.
+_ERROR_SHELL_MARKERS = (
+    "author not found",
+    "page not found",
+    "404 not found",
+)
+_ERROR_SHELL_MAX_EXCERPT = 256
+
+
+def _is_error_shell(evidence: Evidence) -> bool:
+    text = f"{evidence.claim or ''} {evidence.content_excerpt or ''}".lower()
+    if not any(marker in text for marker in _ERROR_SHELL_MARKERS):
+        return False
+    return len((evidence.content_excerpt or "").strip()) < _ERROR_SHELL_MAX_EXCERPT
 
 # Comparing a shortener cannot establish officiality.
 URL_SHORTENERS = {
@@ -54,6 +73,67 @@ URL_SHORTENERS = {
 
 class ContradictionError(Exception):
     """Raised when evidence cannot resolve without ambiguity."""
+
+
+_SHA256_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
+
+
+def verify_provenance(evidence: Evidence) -> Optional[str]:
+    """Validate an EvidenceProvenance against the evidence it claims to describe.
+
+    Returns None when the provenance is fully consistent and self-declaring a
+    genuine SafeFetcher retrieval; otherwise returns a structured reason code
+    describing the first failed binding. Any failure must fail closed: the
+    evidence cannot be OFFICIAL.
+
+    Verified bindings (review round 2):
+    - retrieval_method is exactly "safe_fetch";
+    - http_status is a 2xx;
+    - final_url parses to an http(s) URL and binds to the evidence URL
+      (canonical equality — Evidence.from_fetch sets url = final_url);
+    - redirect_chain, when present, starts at original_url and contains only
+      parseable http(s) URLs;
+    - content_sha256 is a well-formed sha256 hex digest;
+    - retrieved_from_origin is true.
+    """
+    prov = evidence.provenance
+    if prov is None:
+        return "provenance_missing"
+    if prov.retrieval_method != "safe_fetch":
+        return "retrieval_method_not_safe_fetch"
+    if not (200 <= int(prov.http_status) < 300):
+        return "http_status_not_2xx"
+    if not prov.retrieved_from_origin:
+        return "not_retrieved_from_origin"
+    if not isinstance(prov.content_sha256, str) or not _SHA256_RE.match(prov.content_sha256):
+        return "content_sha256_malformed"
+    try:
+        final = urlparse(prov.final_url)
+    except ValueError:
+        return "final_url_unparseable"
+    if (final.scheme or "").lower() not in ("http", "https") or not final.hostname:
+        return "final_url_bad_scheme"
+    if canonicalize_evidence_url(prov.final_url) != canonicalize_evidence_url(evidence.url):
+        return "final_url_not_bound_to_evidence"
+    chain = prov.redirect_chain or []
+    if chain:
+        try:
+            first = urlparse(chain[0])
+        except ValueError:
+            return "redirect_chain_unparseable"
+        if canonicalize_evidence_url(chain[0]) != canonicalize_evidence_url(prov.original_url):
+            return "redirect_chain_not_from_original"
+        for hop in chain:
+            try:
+                parsed_hop = urlparse(hop)
+            except ValueError:
+                return "redirect_chain_unparseable"
+            if (parsed_hop.scheme or "").lower() not in ("http", "https") or not parsed_hop.hostname:
+                return "redirect_chain_bad_scheme"
+    else:
+        if canonicalize_evidence_url(prov.original_url) != canonicalize_evidence_url(prov.final_url):
+            return "original_final_mismatch_without_redirects"
+    return None
 
 
 @dataclass(frozen=True)
@@ -193,15 +273,33 @@ class OfficialEvidenceValidator:
     # --- officiality --------------------------------------------------------
 
     def evaluate(self, evidence: Evidence) -> ValidationDecision:
-        """Decide officiality with a deterministic rule id and note."""
-        if evidence.officiality in (Officiality.OFFICIAL, Officiality.REJECTED):
+        """Decide officiality with a deterministic rule id and note.
+
+        FIX-001: officiality is ALWAYS recomputed from trust anchors and
+        provenance. The old TA-000 shortcut (trusting a pre-existing OFFICIAL
+        or REJECTED) is removed.
+
+        Provenance gate: only evidence retrieved from the origin can be
+        OFFICIAL.  Evidence without SafeFetcher provenance or with
+        retrieved_from_origin=false can still be LIKELY_OFFICIAL or
+        THIRD_PARTY depending on trust anchor matching — it is just
+        never OFFICIAL.
+        """
+        if evidence.officiality is Officiality.REJECTED:
             return ValidationDecision(
-                officiality=evidence.officiality,
+                officiality=Officiality.REJECTED,
                 rule_id="TA-000",
-                note="officiality already decided; validator never re-decides",
+                note="REJECTED preserved; explicit human or gate decision",
             )
+
         host = _normalize_host(urlparse(evidence.url).hostname or "")
         repo = github_repo_from_url(evidence.url)
+
+        # Strict provenance verification (review round 2): a constructed or
+        # imported provenance that fails ANY binding check can never be
+        # OFFICIAL, even when retrieved_from_origin claims true.
+        provenance_failure = verify_provenance(evidence)
+        provenance_ok = provenance_failure is None
 
         if not self._provider_has_anchors(evidence.provider_id):
             return ValidationDecision(
@@ -219,26 +317,48 @@ class OfficialEvidenceValidator:
 
         anchor = self._anchor_for(evidence.provider_id, host, repo)
         if anchor is not None:
+            if _is_error_shell(evidence):
+                return ValidationDecision(
+                    officiality=Officiality.REJECTED,
+                    rule_id=RULE_ERROR_SHELL,
+                    note="anchor-matched page is an error shell (soft 404); not valid evidence",
+                )
             if repo is not None and self._github_rule_applies(anchor, repo):
+                if not provenance_ok:
+                    return ValidationDecision(
+                        officiality=Officiality.LIKELY_OFFICIAL,
+                        rule_id=RULE_GITHUB_MAPPING,
+                        note=f"mapped official GitHub repository {repo!r} but provenance gate failed ({provenance_failure}); cannot be OFFICIAL",
+                    )
                 return ValidationDecision(
                     officiality=Officiality.OFFICIAL,
                     rule_id=RULE_GITHUB_MAPPING,
                     note=f"mapped official GitHub repository {repo!r}",
                 )
             normalized = [_normalize_host(d) for d in anchor.domains]
-            if host and any(d == host for d in normalized):
+            host_match = host and any(d == host for d in normalized)
+            subdomain_match = (
+                host and anchor.allow_subdomains
+                and any(host.endswith("." + d) for d in normalized)
+            )
+            if host_match or subdomain_match:
+                if not provenance_ok:
+                    rule_id = RULE_EXACT_DOMAIN if host_match else RULE_ALLOWED_SUBDOMAIN
+                    return ValidationDecision(
+                        officiality=Officiality.LIKELY_OFFICIAL,
+                        rule_id=rule_id,
+                        note=f"anchor for {anchor.provider_id!r} matches domain but provenance gate failed ({provenance_failure}); cannot be OFFICIAL",
+                    )
                 return ValidationDecision(
                     officiality=Officiality.OFFICIAL,
-                    rule_id=RULE_EXACT_DOMAIN,
-                    note=f"exact configured anchor domain for {anchor.provider_id!r}",
+                    rule_id=RULE_EXACT_DOMAIN if host_match else RULE_ALLOWED_SUBDOMAIN,
+                    note=f"matched configured anchor for {anchor.provider_id!r}",
                 )
-            if host and anchor.allow_subdomains and any(
-                host.endswith("." + d) for d in normalized
-            ):
+            if not provenance_ok:
                 return ValidationDecision(
-                    officiality=Officiality.OFFICIAL,
-                    rule_id=RULE_ALLOWED_SUBDOMAIN,
-                    note=f"anchor for {anchor.provider_id!r} allows this subdomain",
+                    officiality=Officiality.LIKELY_OFFICIAL,
+                    rule_id=RULE_NO_MATCH_THIRD_PARTY,
+                    note="anchor found for provider but domain does not match; cannot be OFFICIAL",
                 )
             return ValidationDecision(
                 officiality=Officiality.OFFICIAL,
@@ -315,6 +435,25 @@ class OfficialEvidenceValidator:
 
     # --- contradictions ------------------------------------------------------
 
+    @staticmethod
+    def _latest_per_url(evidences: List[Evidence]) -> List[Evidence]:
+        """Collapse same-URL snapshots to the freshest retrieval.
+
+        Evidence IDs are content-addressed, so re-fetching one source URL can
+        append several OFFICIAL snapshots whose text drifted slightly. At
+        decision time they are one source; retrieved_at (freshness only, per
+        spec 8.3) picks which snapshot stands. Ties break by evidence_id.
+        """
+        latest: Dict[str, Evidence] = {}
+        for e in evidences:
+            current = latest.get(e.url)
+            if current is None or (e.retrieved_at, e.evidence_id) > (
+                current.retrieved_at,
+                current.evidence_id,
+            ):
+                latest[e.url] = e
+        return list(latest.values())
+
     def resolve_contradictions(
         self, evidences: List[Evidence], require_dates: bool = False
     ) -> Dict[str, Any]:
@@ -324,6 +463,7 @@ class OfficialEvidenceValidator:
         then ``published_at``. ``retrieved_at`` never acts as the policy date.
         """
         official = [e for e in evidences if e.officiality is Officiality.OFFICIAL]
+        official = self._latest_per_url(official)
         if not official:
             raise ContradictionError("no OFFICIAL evidence supports confirmation")
 

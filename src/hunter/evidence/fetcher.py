@@ -10,10 +10,12 @@ max 6 pages per Provider per run. No scripts, no cookies, no auth headers.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urljoin, urlparse
 
@@ -36,6 +38,13 @@ class FetchResult:
     headers: Dict[str, str]
     body: bytes
     final_url: str
+    original_url: str = ""
+    redirect_chain: List[str] = field(default_factory=list)
+    content_sha256: str = ""
+    retrieved_from_origin: bool = True
+    retrieval_method: str = "safe_fetch"
+    retrieved_at: Optional[datetime] = None
+    connected_ip: Optional[str] = None
 
 
 def check_host_addresses(addresses: Sequence[ipaddress._BaseAddress]) -> bool:
@@ -97,48 +106,103 @@ def check_url(url: str) -> urlparse.ParseResult:
 
 
 class SafeFetcher:
-    """HTTP(S) fetcher enforcing all SSRF and size/timeout limits."""
+    """HTTP(S) fetcher enforcing all SSRF and size/timeout limits.
+
+    Production instances must be constructed WITHOUT ``test_transport``: the
+    real path resolves a verified public IP, pins the connection to it (DNS
+    rebinding protection), keeps the hostname only for Host/SNI, and
+    re-resolves on every redirect hop.
+
+    ``test_transport`` is an explicit TEST-ONLY seam (review round 2): it
+    replaces the socket layer in offline tests and MUST honor the pinned IP
+    it is handed — the resolved, validated address is passed to every
+    ``request(url, pinned_ip=...)`` call so a fake that "connects" uses the
+    same address the production path would use.
+    """
 
     def __init__(
         self,
-        transport: Any = None,
         max_redirects: int = MAX_REDIRECTS,
         max_body_bytes: int = MAX_BODY_BYTES,
         total_timeout: float = TOTAL_TIMEOUT,
         max_pages_per_provider: int = MAX_PAGES_PER_PROVIDER,
         resolver=None,
+        test_transport: Any = None,
     ):
-        self.transport = transport
         self.max_redirects = max_redirects
         self.max_body_bytes = max_body_bytes
         self.total_timeout = total_timeout
         self.max_pages_per_provider = max_pages_per_provider
         self._resolver = resolver
+        self.transport = test_transport  # TEST-ONLY seam; None in production
         self._page_counts: Dict[str, int] = {}
 
     def fetch(self, url: str, provider_id: str) -> FetchResult:
         self._bump_page_count(provider_id)
         start = time.monotonic()
         current = url
+        chain: List[str] = []
         for _ in range(self.max_redirects + 1):
             parsed = check_url(current)
             self._assert_public(parsed)
-            status, headers, body = self._transact(parsed, start)
+            pinned_ip = self._pick_public_ip(parsed)
+            status, headers, body = self._transact(parsed, start, pinned_ip=pinned_ip)
             location = headers.get("location")
             if status in (301, 302, 303, 307, 308) and location:
+                chain.append(current)
                 current = urljoin(current, location)
                 # redirect destination is revalidated from scratch
                 continue
             self._check_declared_length(headers)
             self._check_content_type(headers)
             body = self._read_limited(body)
+            sha256 = hashlib.sha256(body).hexdigest()
+            now_dt = datetime.now(timezone.utc)
             return FetchResult(
                 status=status,
                 headers=headers,
                 body=body,
                 final_url=current,
+                original_url=url,
+                redirect_chain=chain,
+                content_sha256=sha256,
+                retrieved_from_origin=True,
+                retrieval_method="safe_fetch",
+                retrieved_at=now_dt,
+                connected_ip=pinned_ip,
             )
         raise FetcherError("too many redirects")
+
+    def _pick_public_ip(self, parsed: urlparse.ParseResult) -> str:
+        """Resolve and return ONE verified public IP (IPv4 preferred).
+
+        DNS rebinding protection: we pick a concrete IP *before* connecting
+        and pass it to _transact so the transport connects to that exact IP,
+        not to a freshly-resolved hostname.
+        """
+        host = parsed.hostname or ""
+        if self.transport is not None and hasattr(self.transport, "resolve"):
+            raw = self.transport.resolve(host)
+            if not raw:
+                raise FetcherError(f"cannot resolve host {host!r}")
+            addresses = [ipaddress.ip_address(a) for a in raw]
+        else:
+            try:
+                infos = socket.getaddrinfo(host, None)
+                addresses = [ipaddress.ip_address(info[4][0]) for info in infos]
+            except (socket.gaierror, ValueError, OSError) as exc:
+                raise FetcherError(f"cannot resolve host {host!r}: {exc}") from exc
+
+        if not addresses:
+            raise FetcherError(f"no addresses for host {host!r}")
+        if not check_host_addresses(addresses):
+            raise FetcherError(f"host {host!r} resolves to non-public addresses")
+
+        # Prefer IPv4 for connection stability
+        v4 = [a for a in addresses if isinstance(a, ipaddress.IPv4Address)]
+        if v4:
+            return str(v4[0])
+        return str(addresses[0])
 
     def _assert_public(self, parsed: urlparse.ParseResult) -> None:
         host = parsed.hostname or ""
@@ -153,7 +217,7 @@ class SafeFetcher:
         if not dns_resolve(host, self._resolver):
             raise FetcherError(f"host {host!r} does not resolve to public addresses")
 
-    def _transact(self, parsed, start) -> tuple[int, Dict[str, str], bytes]:
+    def _transact(self, parsed, start, pinned_ip=None) -> tuple[int, Dict[str, str], bytes]:
         host = parsed.hostname or ""
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         remaining = self.total_timeout - (time.monotonic() - start)
@@ -161,7 +225,9 @@ class SafeFetcher:
             raise FetcherError("total request timeout exceeded")
         url = parsed.geturl()
         if self.transport is not None:
-            result = self.transport.request(url)
+            # TEST-ONLY seam: the fake MUST honor the pinned IP it is given
+            # (same validated address the production path connects to).
+            result = self.transport.request(url, pinned_ip=pinned_ip)
             if time.monotonic() - start > self.total_timeout:
                 raise FetcherError("total request timeout exceeded")
             status, headers, body = result
@@ -169,21 +235,45 @@ class SafeFetcher:
                 str(key).lower(): str(value) for key, value in dict(headers).items()
             }
             return status, normalized_headers, body
-        return self._real_request(host, port, url, remaining, parsed.scheme)
+        return self._real_request(host, port, parsed, remaining, pinned_ip=pinned_ip)
 
     def _real_request(
-        self, host, port, url, timeout, scheme=None
+        self, host, port, parsed, timeout, pinned_ip=None
     ) -> tuple[int, Dict[str, str], bytes]:
-        # Deliberately simple: no cookies, no auth, no scripts.
+        # DNS rebinding protection (FIX-003):
+        # Connect to the verified public IP, keep the hostname for Host/SNI.
         import http.client
+        import ssl
 
-        scheme = scheme or urlparse(url).scheme
-        connection_class = (
-            http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-        )
-        conn = connection_class(host, port, timeout=timeout)
+        url = parsed.geturl()
+        scheme = parsed.scheme
         try:
-            conn.request("GET", url)
+            request_target = parsed.path or "/"
+            if parsed.query:
+                request_target += "?" + parsed.query
+        except ValueError:
+            request_target = "/"
+        if pinned_ip:
+            # Pin the socket to the validated IP; hostname stays in Host/SNI.
+            raw_sock = socket.create_connection((pinned_ip, port), timeout=timeout)
+            if scheme == "https":
+                context = ssl.create_default_context()
+                sock = context.wrap_socket(raw_sock, server_hostname=host)
+                conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+                conn.sock = sock
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=timeout)
+                conn.sock = raw_sock
+        else:
+            connection_class = (
+                http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+            )
+            conn = connection_class(host, port, timeout=timeout)
+        try:
+            # Origin-form request target (absolute-form confuses many origins).
+            # http.client derives the Host header from the connection host,
+            # which is the original hostname even when pinned to an IP.
+            conn.request("GET", request_target)
             response = conn.getresponse()
             headers = {str(k).lower(): str(v) for k, v in response.getheaders()}
             self._check_declared_length(headers)

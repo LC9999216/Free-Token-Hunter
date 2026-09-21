@@ -8,6 +8,7 @@ tasks. Unknown commands fail with a non-zero exit code.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -110,13 +111,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="data directory (defaults to config paths.data_dir)",
     )
+    pipeline.add_argument(
+        "--require-llm",
+        action="store_true",
+        help="exit nonzero unless the real grounded LLM extractor is configured",
+    )
     pipeline.set_defaults(handler=_handle_pipeline)
 
     alias = subparsers.add_parser("pipeline", help="alias for run-stage-one")
     alias.add_argument("--seed", default=None)
     alias.add_argument("--as-of", default=None)
     alias.add_argument("--data-dir", default=None)
+    alias.add_argument("--require-llm", action="store_true")
     alias.set_defaults(handler=_handle_pipeline)
+
+    # Stage 2 subcommands (nested parsers; handlers live in cli_imports and
+    # delegate to hunter.runtime.stage2 workers — no business logic here).
+    try:
+        from .cli_imports import register_stage_two_parsers
+
+        register_stage_two_parsers(subparsers)
+    except ImportError:  # pragma: no cover - defensive
+        pass
 
     for name, (help_text, handler) in sorted(_SUBCOMMANDS.items()):
         sub = subparsers.add_parser(name, help=help_text)
@@ -225,58 +241,29 @@ def _env_or_none(name: str):
 
 
 def _handle_collect_evidence(args: argparse.Namespace) -> int:
-    from .config import load_settings, load_sources
+    from .config import load_settings
     from .discovery.store import CandidateStore
+    from .evidence.collect import collect_evidence
     from .evidence.fetcher import SafeFetcher
-    from .evidence.resolver import EvidenceResolver
     from .evidence.store import EvidenceStore
 
     settings = load_settings()
-    sources = load_sources()
     if args.data_dir:
         data_dir = Path(args.data_dir)
     else:
         data_dir = Path(settings["paths"]["data_dir"])
     candidate_store = CandidateStore(data_dir / "candidates.json")
     evidence_store = EvidenceStore(data_dir / "evidence.json")
-    resolver = EvidenceResolver()
     fetcher = SafeFetcher(max_pages_per_provider=args.max_pages_per_provider)
-
-    candidates = candidate_store.list_candidates()
-    if args.candidate_id:
-        candidates = [c for c in candidates if c.candidate_id == args.candidate_id]
-    fetched = 0
-    for candidate in candidates:
-        observations = [o.model_dump(mode="json") for o in candidate.observations]
-        urls = resolver.propose_urls(
-            candidate_domain=candidate.canonical_domain_hint,
-            observations=observations,
-        )
-        for url in urls:
-            if fetched >= args.limit:
-                break
-            try:
-                result = fetcher.fetch(url, provider_id=candidate.candidate_id)
-            except Exception as exc:  # noqa: BLE001 - fetch failures are per-URL
-                print(f"{candidate.candidate_id}: {url} -> ERROR {exc}")
-                continue
-            text = result.body.decode("utf-8", errors="replace")[:2000]
-            excerpt = _plain_text_excerpt(text)
-            from .evidence.models import Evidence
-
-            evidence_store.upsert(
-                Evidence(
-                    candidate_id=candidate.candidate_id,
-                    url=url,
-                    source_type=_guess_source_type(url),
-                    title=url,
-                    claim=excerpt[:300],
-                    content_excerpt=excerpt,
-                )
-            )
-            fetched += 1
-            print(f"{candidate.candidate_id}: {url} -> {result.status}")
-    print(f"fetched={fetched}")
+    report = collect_evidence(
+        candidate_store,
+        evidence_store,
+        fetcher,
+        candidate_id=args.candidate_id,
+        limit=args.limit,
+    )
+    for line in report.as_lines():
+        print(line)
     return 0
 
 
@@ -303,6 +290,8 @@ def _plain_text_excerpt(text: str) -> str:
 def _handle_pipeline(args: argparse.Namespace) -> int:
     from datetime import datetime, timezone
 
+    from .llm.client import LlmConfigurationError
+    from .llm.runtime import build_grounded_extractor_from_env
     from .pipeline import Pipeline
 
     if args.data_dir:
@@ -310,10 +299,23 @@ def _handle_pipeline(args: argparse.Namespace) -> int:
     else:
         settings = load_settings()
         data_dir = Path(settings["paths"]["data_dir"])
+    try:
+        extractor = build_grounded_extractor_from_env()
+    except LlmConfigurationError as exc:
+        print(f"hunter: {exc}", file=sys.stderr)
+        return 2
+    if args.require_llm and extractor is None:
+        print(
+            "hunter: a real grounded LLM extractor is required; configure "
+            "HUNTER_LLM_BASE_URL, HUNTER_LLM_API_KEY, and HUNTER_LLM_MODEL",
+            file=sys.stderr,
+        )
+        return 2
     pipeline = Pipeline(
         data_dir=data_dir,
         seed_path=Path(args.seed) if args.seed else None,
         as_of=datetime.fromisoformat(args.as_of) if args.as_of else datetime.now(timezone.utc),
+        extractor=extractor,
     )
     summary = pipeline.run()
     for key in (
@@ -333,6 +335,11 @@ def _handle_pipeline(args: argparse.Namespace) -> int:
     if detail:
         print(f"evidence_built={detail.get('evidence_built', 0)}")
         print(f"providers={detail.get('providers', 0)}")
+        for outcome in detail.get("candidate_outcomes", []):
+            print(
+                "candidate_outcome="
+                + json.dumps(outcome, sort_keys=True, separators=(",", ":"))
+            )
     return 0
 
 

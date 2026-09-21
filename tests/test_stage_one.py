@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from hunter.evidence.models import Evidence, Officiality
+from hunter.evidence.models import Evidence, EvidenceProvenance, Officiality
 from hunter.evidence.validator import OfficialEvidenceValidator, TrustAnchor
 from hunter.llm.models import ExtractionResult, GroundedField
 from hunter.pipeline import Pipeline
@@ -297,12 +297,22 @@ def _anchor() -> TrustAnchor:
 
 
 def _official_evidence() -> Evidence:
+    provenance = EvidenceProvenance(
+        retrieval_method="safe_fetch",
+        original_url="https://acme.ai/pricing",
+        final_url="https://acme.ai/pricing",
+        http_status=200,
+        content_sha256="a" * 64,
+        retrieved_from_origin=True,
+        retrieved_at=AS_OF,
+    )
     return Evidence(
         evidence_id="ev-acme",
         provider_id="acme",
         url="https://acme.ai/pricing",
         source_type="pricing",
         officiality=Officiality.OFFICIAL,
+        provenance=provenance,
         retrieved_at=AS_OF,
         effective_at=AS_OF,
         claim="free plan programmatic API",
@@ -509,12 +519,22 @@ def test_consumer_chat_only_offer_rejected(tmp_path: Path) -> None:
         ],
     )
     # no documented programmatic API scope in the evidence
+    provenance = EvidenceProvenance(
+        retrieval_method="safe_fetch",
+        original_url="https://acme.ai/pricing",
+        final_url="https://acme.ai/pricing",
+        http_status=200,
+        content_sha256="a" * 64,
+        retrieved_from_origin=True,
+        retrieved_at=AS_OF,
+    )
     evidence = Evidence(
         evidence_id="ev-chat",
         provider_id="acme",
         url="https://acme.ai/pricing",
         source_type="pricing",
         officiality=Officiality.OFFICIAL,
+        provenance=provenance,
         retrieved_at=AS_OF,
         effective_at=AS_OF,
         claim="free web chat",

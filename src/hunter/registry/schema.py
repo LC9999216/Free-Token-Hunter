@@ -107,6 +107,78 @@ class ProviderRequirements(BaseModel):
     regional_restrictions: Optional[str] = None
 
 
+class GroundedUrl(BaseModel):
+    """A URL grounded in evidence (FIX-004).
+
+    Every non-null ProviderSetup URL must carry an evidence citation:
+    which evidence record, the exact quote, and its offsets.
+
+    Review round 2: the URL, evidence_id, and quote must be non-empty; the
+    URL scheme must be http(s); offsets must be non-negative and ordered
+    (0 <= start < end); and :meth:`verify_against` checks the quote actually
+    appears at those offsets in the cited evidence content.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str
+    evidence_id: str
+    quote: str
+    start_offset: int = 0
+    end_offset: int = 0
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("grounded url must not be empty")
+        from urllib.parse import urlparse
+
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError(f"grounded url must be http(s): {v!r}")
+        return v
+
+    @field_validator("evidence_id", "quote")
+    @classmethod
+    def _nonempty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("grounded citation fields must be non-empty")
+        return v
+
+    @model_validator(mode="after")
+    def _ordered_offsets(self) -> "GroundedUrl":
+        if self.start_offset < 0 or self.end_offset < 0:
+            raise ValueError("offsets must be non-negative")
+        if self.end_offset <= self.start_offset:
+            raise ValueError("end_offset must be greater than start_offset")
+        return self
+
+    def verify_against(self, evidence: Any) -> bool:
+        """True when the quote exists at exactly these offsets in evidence."""
+        text = getattr(evidence, "content_excerpt", None) or ""
+        if getattr(evidence, "evidence_id", None) != self.evidence_id:
+            return False
+        if self.end_offset > len(text):
+            return False
+        return text[self.start_offset : self.end_offset] == self.quote
+
+
+class ProviderSetup(BaseModel):
+    """Provider setup URLs grounded in evidence (FIX-004).
+
+    All fields are optional; a URL is stored only if grounded evidence exists.
+    Missing fields default to None. No third-party registry values are copied.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signup_url: Optional[GroundedUrl] = None
+    api_key_url: Optional[GroundedUrl] = None
+    setup_instructions_url: Optional[GroundedUrl] = None
+
+
 class ProviderApi(BaseModel):
     """Provider API surface (AGENTS.md 4.5)."""
 
@@ -162,6 +234,7 @@ class Provider(BaseModel):
     limits: ProviderLimits = Field(default_factory=ProviderLimits)
     evidence_ids: List[str] = Field(default_factory=list)
     official_docs: List[str] = Field(default_factory=list)
+    setup: Optional[ProviderSetup] = None
     first_discovered: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_verified: Optional[datetime] = None
     verification_confidence: Optional[int] = None

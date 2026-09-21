@@ -7,6 +7,7 @@ from hunter.discovery.models import CandidateObservation, SourceType
 from hunter.discovery.store import CandidateStore, ObservationWithCandidate
 from hunter.evidence.resolver import EvidenceResolver
 from hunter.evidence.validator import OfficialEvidenceValidator, TrustAnchor
+from hunter.llm.models import ExtractionResult
 from hunter.pipeline import Pipeline
 from tests.fakes import FakeFetcher, FakeGroundedExtractor
 
@@ -31,6 +32,21 @@ class StaticResolver(EvidenceResolver):
         return list(self.urls)
 
 
+class FailingGroundedExtractor:
+    def extract(self, evidence, as_of: str) -> ExtractionResult:
+        return ExtractionResult(ok=False, failure_reason="grounding mismatch")
+
+
+class IncompleteGroundedExtractor:
+    def extract(self, evidence, as_of: str) -> ExtractionResult:
+        return ExtractionResult(ok=True)
+
+
+class ExplodingGroundedExtractor:
+    def extract(self, evidence, as_of: str) -> ExtractionResult:
+        raise ValueError("invalid normalized value near sk-supersecret123456")
+
+
 def _seed_candidate(
     tmp_path: Path,
     claim: str,
@@ -38,6 +54,7 @@ def _seed_candidate(
     *,
     resolver: EvidenceResolver | None = None,
     fetcher: FakeFetcher | None = None,
+    sources_path: Path | None = None,
 ) -> tuple[Pipeline, FakeFetcher, FakeGroundedExtractor, EvidenceResolver]:
     data_dir = tmp_path / "data"
     store = CandidateStore(data_dir / "candidates.json")
@@ -73,11 +90,49 @@ def _seed_candidate(
         resolver=resolver,
         fetcher=fetcher,
         extractor=extractor,
+        sources_path=sources_path,
     )
     pipeline.validator = OfficialEvidenceValidator(
         [TrustAnchor(provider_id="acme", domains=["acme.ai"], provenance="test", reviewed_at="2026-09-01")]
     )
     return pipeline, fetcher, extractor, resolver
+
+
+def test_pipeline_prefers_manually_reviewed_evidence_urls(tmp_path: Path) -> None:
+    sources_path = tmp_path / "sources.yaml"
+    sources_path.write_text(
+        """
+trust_anchors:
+  - provider_id: acme
+    domains: [acme.ai]
+    allow_subdomains: true
+    provenance: manual review
+    reviewed_at: '2026-09-18'
+reviewed_evidence:
+  acme:
+    - url: https://acme.ai/docs/free-credits
+      source_type: pricing
+""".strip(),
+        encoding="utf-8",
+    )
+    fetcher = FakeFetcher(
+        {"https://acme.ai/docs/free-credits": "New accounts receive $50 in free API credits."}
+    )
+    pipeline, fetcher, _extractor, resolver = _seed_candidate(
+        tmp_path,
+        "third-party assertion",
+        "unused",
+        fetcher=fetcher,
+        sources_path=sources_path,
+    )
+
+    pipeline.build_evidence()
+
+    assert fetcher.calls == [("https://acme.ai/docs/free-credits", "acme")]
+    assert getattr(resolver, "calls", []) == []
+    evidence = pipeline.evidence_store.list()
+    assert len(evidence) == 1
+    assert evidence[0].source_type == "pricing"
 
 
 def test_pipeline_uses_fetched_body_and_never_asserted_claim_or_as_of_as_policy_date(
@@ -139,6 +194,61 @@ def test_pipeline_without_real_extractor_fails_closed(tmp_path: Path) -> None:
     assert pipeline.registry.list_providers() == []
 
 
+def test_pipeline_reports_sanitized_extraction_failure_per_candidate(
+    tmp_path: Path,
+) -> None:
+    pipeline, _fetcher, _extractor, _resolver = _seed_candidate(
+        tmp_path,
+        "third-party free assertion",
+        "Official free tier programmatic API offer.",
+    )
+    pipeline.extractor = FailingGroundedExtractor()
+
+    summary = pipeline.run()
+
+    assert summary["detail"]["candidate_outcomes"] == [
+        {
+            "candidate_id": "acme",
+            "outcome": "extraction_failed",
+            "reason": "grounding mismatch",
+        }
+    ]
+
+
+def test_pipeline_reports_confirmation_rejection_per_candidate(tmp_path: Path) -> None:
+    pipeline, _fetcher, _extractor, _resolver = _seed_candidate(
+        tmp_path,
+        "third-party free assertion",
+        "Official free tier programmatic API offer.",
+    )
+    pipeline.extractor = IncompleteGroundedExtractor()
+
+    summary = pipeline.run()
+
+    assert summary["detail"]["candidate_outcomes"][0]["candidate_id"] == "acme"
+    assert summary["detail"]["candidate_outcomes"][0]["outcome"] == "confirmation_rejected"
+    assert "offer_kind" in summary["detail"]["candidate_outcomes"][0]["reason"]
+
+
+def test_pipeline_reports_sanitized_unexpected_candidate_error(tmp_path: Path) -> None:
+    pipeline, _fetcher, _extractor, _resolver = _seed_candidate(
+        tmp_path,
+        "third-party free assertion",
+        "Official free tier programmatic API offer.",
+    )
+    pipeline.extractor = ExplodingGroundedExtractor()
+
+    summary = pipeline.run()
+
+    assert summary["errors"] == 1
+    outcome = summary["detail"]["candidate_outcomes"][0]
+    assert outcome["candidate_id"] == "acme"
+    assert outcome["outcome"] == "processing_error"
+    assert "ValueError" in outcome["reason"]
+    assert "sk-supersecret123456" not in outcome["reason"]
+    assert "[REDACTED]" in outcome["reason"]
+
+
 def test_pipeline_resolves_priority_before_extraction(tmp_path: Path) -> None:
     resolver = StaticResolver(
         ["https://acme.ai/pricing", "https://acme.ai/blog/free-tier"]
@@ -194,3 +304,6 @@ def test_pipeline_blocks_equal_priority_contradiction_before_extraction(tmp_path
     assert extractor.calls == []
     assert summary["free_confirmed"] == 0
     assert pipeline.registry.list_providers() == []
+    assert summary["detail"]["candidate_outcomes"][0]["candidate_id"] == "acme"
+    assert summary["detail"]["candidate_outcomes"][0]["outcome"] == "unresolved_contradiction"
+    assert "equal-priority conflict" in summary["detail"]["candidate_outcomes"][0]["reason"]

@@ -4,6 +4,11 @@ Normalizes GitHub search results into provenance-preserving
 CandidateObservations. Repository content is untrusted and never executed.
 The optional token comes only from a named environment variable. Network
 access is fully injectable so tests stay offline.
+
+FIX-003 (Stage 1.5):
+- GITHUB_TOKEN is sent only to api.github.com (Authorization: Bearer).
+- Redirects to non-GitHub domains are refused; the token never leaks.
+- Token is redacted from exceptions, observations, and log output.
 """
 
 from __future__ import annotations
@@ -19,6 +24,34 @@ from ..discovery.models import CandidateObservation, SourceType
 
 GITHUB_API = "https://api.github.com/search/repositories"
 
+# The token may ONLY ever be sent to this exact origin (scheme+host+port).
+TOKEN_ORIGIN = ("https", "api.github.com", 443)
+
+
+def _origin_of(url: str):
+    """Return (scheme, host, port) for a URL, defaulting port per scheme."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    scheme = (parsed.scheme or "").lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return scheme, host, port
+
+
+def auth_headers_for(url: str, token: Optional[str]) -> Dict[str, str]:
+    """Build request headers, attaching the token ONLY to https://api.github.com:443.
+
+    FIX (review round 2): the previous code matched on host alone, so an
+    ``http://api.github.com`` URL would have received the bearer token in
+    cleartext. Scheme and port are now part of the gate.
+    """
+    headers = {"Accept": "application/vnd.github+json"}
+    if not token:
+        return headers
+    scheme, host, port = _origin_of(url)
+    if (scheme, host, port) == TOKEN_ORIGIN:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
 
 class GitHubHttpError(Exception):
     """Raised for HTTP errors (rate limits, transient failures)."""
@@ -28,20 +61,87 @@ class GitHubHttpError(Exception):
         self.status = status
 
 
+class RedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Redirect policy that keeps the Authorization token inside its origin.
+
+    Rules (review round 2):
+    - Non-HTTPS redirect targets are always refused (no HTTP downgrade).
+    - Redirects to any host other than api.github.com / github.com abort
+      (plan §4.4: non-official redirect targets are not followed).
+    - The Authorization header is forwarded only when the redirect target is
+      exactly https://api.github.com:443; every other target — including
+      github.com — has it stripped before following.
+    - Non-standard ports are refused outright.
+    """
+
+    REDIRECTABLE_HOSTS = ("api.github.com", "github.com")
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        scheme, host, port = _origin_of(newurl)
+        if scheme != "https":
+            raise urllib.error.HTTPError(
+                newurl, code,
+                f"refusing non-https redirect to {host!r}",
+                headers, fp,
+            )
+        if host not in self.REDIRECTABLE_HOSTS:
+            raise urllib.error.HTTPError(
+                newurl, code,
+                f"refusing redirect to non-official domain {host!r}",
+                headers, fp,
+            )
+        if port != 443:
+            raise urllib.error.HTTPError(
+                newurl, code,
+                f"refusing redirect to non-standard port {port}",
+                headers, fp,
+            )
+        new_request = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_request is None:
+            return None
+        if (scheme, host, port) != TOKEN_ORIGIN:
+            # Never forward the token to github.com or anywhere else.
+            new_request.headers.pop("Authorization", None)
+            new_request.unredirected_hdrs.pop("Authorization", None)
+        return new_request
+
+
 class HttpTransport:
-    """Minimal injectable HTTP JSON GET (default uses urllib, no auth headers)."""
+    """Minimal injectable HTTP JSON GET (default uses urllib, no auth headers).
+
+    FIX-003: token is sent only to api.github.com via Authorization header,
+    and errors are sanitized so the token never appears in exception text.
+    """
+
+    def __init__(self, token: Optional[str] = None):
+        self._token = token
+
+    def _sanitize(self, msg: str) -> str:
+        """Redact token-like patterns from messages."""
+        if self._token:
+            msg = msg.replace(self._token, "***REDACTED***")
+        # Also redact common bearer patterns
+        import re as _re
+        msg = _re.sub(r'(Bearer|bearer|api[_-]?key|token)[\s=:]+[A-Za-z0-9_\-\.]+', r'\1 ***REDACTED***', msg)
+        return msg
 
     def get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         if params:
             url = url + "?" + urllib.parse.urlencode(params)
-        request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        # Token is attached only to https://api.github.com:443.
+        headers = auth_headers_for(url, self._token)
+
+        opener = urllib.request.build_opener(RedirectHandler)
+        request = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with opener.open(request, timeout=30) as response:
                 body = response.read()
         except urllib.error.HTTPError as exc:
-            raise GitHubHttpError(f"github http {exc.code}: {exc.reason}", exc.code) from exc
+            msg = self._sanitize(f"github http {exc.code}: {exc.reason}")
+            raise GitHubHttpError(msg, exc.code) from exc
         except urllib.error.URLError as exc:
-            raise GitHubHttpError(f"github network error: {exc.reason}") from exc
+            msg = self._sanitize(f"github network error: {exc.reason}")
+            raise GitHubHttpError(msg) from exc
         try:
             return json.loads(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
@@ -59,7 +159,7 @@ class GitHubCollector:
         per_page: int = 10,
         max_total: int = 50,
     ):
-        self.http = http or HttpTransport()
+        self.http = http or HttpTransport(token=token)
         self.token = token  # token is only read from env by the factory
         self.queries = queries or ["free llm api"]
         self.per_page = per_page

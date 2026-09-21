@@ -104,3 +104,11 @@ trust_anchors:
     github_organizations: [jina-ai]
     provenance: "manual review of jina.ai, 2026-09-01"
     reviewed_at: "2026-09-01"
+
+# Exact first-party pages selected by manual review. When present for a
+# provider, these replace imported and guessed evidence URLs; the trust-anchor
+# validator still decides officiality after a safe fetch.
+reviewed_evidence:
+  assemblyai:
+    - url: https://support.assemblyai.com/articles/5370767329-can-i-sign-up-for-free
+      source_type: pricing

@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from hunter.evidence.models import Evidence, Officiality
+from datetime import datetime, timezone
+
+from hunter.evidence.models import Evidence, EvidenceProvenance, Officiality
 from hunter.evidence.validator import (
     RULE_ALLOWED_SUBDOMAIN,
     RULE_EXACT_DOMAIN,
@@ -61,12 +63,26 @@ def _validator(anchors=None) -> OfficialEvidenceValidator:
 
 
 def _evidence(url: str, source_type: str = "pricing", provider_id: str = "acme", **kw) -> Evidence:
+    # For OFFICIAL tests, auto-attach provenance
+    officiality = kw.pop("officiality", Officiality.UNCONFIRMED)
+    provenance = kw.pop("provenance", None)
+    if provenance is None and officiality is Officiality.OFFICIAL:
+        provenance = EvidenceProvenance(
+            retrieval_method="safe_fetch",
+            original_url=url,
+            final_url=url,
+            http_status=200,
+            content_sha256="a" * 64,
+            retrieved_from_origin=True,
+            retrieved_at=datetime.fromisoformat(str(kw.get("retrieved_at", "2026-08-01T00:00:00+00:00"))),
+        )
     return Evidence(
         evidence_id=kw.pop("evidence_id", "ev-1"),
         provider_id=provider_id,
         url=url,
         source_type=source_type,
-        officiality=kw.pop("officiality", Officiality.UNCONFIRMED),
+        officiality=officiality,
+        provenance=provenance,
         claim=kw.pop("claim", "free plan"),
         content_excerpt=kw.pop("content_excerpt", "free plan"),
         retrieved_at=kw.pop("retrieved_at", "2026-08-01T00:00:00+00:00"),
@@ -178,14 +194,14 @@ def test_github_repo_from_url() -> None:
 
 def test_anchored_exact_domain_is_official() -> None:
     v = _validator()
-    decision = v.evaluate(_evidence("https://acme.ai/pricing"))
+    decision = v.evaluate(_evidence("https://acme.ai/pricing", officiality=Officiality.OFFICIAL))
     assert decision.officiality is Officiality.OFFICIAL
     assert decision.rule_id == RULE_EXACT_DOMAIN
 
 
 def test_anchored_subdomain_is_official_when_allowed() -> None:
     v = _validator()
-    decision = v.evaluate(_evidence("https://docs.beta.dev/pricing", provider_id="beta"))
+    decision = v.evaluate(_evidence("https://docs.beta.dev/pricing", provider_id="beta", officiality=Officiality.OFFICIAL))
     assert decision.officiality is Officiality.OFFICIAL
     assert decision.rule_id == RULE_ALLOWED_SUBDOMAIN
 
@@ -200,7 +216,7 @@ def test_prohibited_subdomain_is_likely_official() -> None:
 def test_mapped_github_is_official() -> None:
     v = _validator()
     decision = v.evaluate(
-        _evidence("https://github.com/beta/llm", source_type="github", provider_id="beta")
+        _evidence("https://github.com/beta/llm", source_type="github", provider_id="beta", officiality=Officiality.OFFICIAL)
     )
     assert decision.officiality is Officiality.OFFICIAL
     assert decision.rule_id == RULE_GITHUB_MAPPING
@@ -253,7 +269,16 @@ def test_search_result_url_never_official() -> None:
 
 def test_validate_appends_rule_note() -> None:
     v = _validator()
-    validated = v.validate(_evidence("https://acme.ai/pricing"))
+    provenance = EvidenceProvenance(
+        retrieval_method="safe_fetch",
+        original_url="https://acme.ai/pricing",
+        final_url="https://acme.ai/pricing",
+        http_status=200,
+        content_sha256="a" * 64,
+        retrieved_from_origin=True,
+        retrieved_at=datetime.fromisoformat("2026-09-01T00:00:00+00:00"),
+    )
+    validated = v.validate(_evidence("https://acme.ai/pricing", provenance=provenance, officiality=Officiality.UNCONFIRMED))
     assert validated.officiality is Officiality.OFFICIAL
     assert any(RULE_EXACT_DOMAIN in n for n in validated.validation_notes)
 
@@ -281,10 +306,21 @@ def test_third_party_assertion_cannot_create_anchor() -> None:
 
 
 def _official(evidence_id, source_type, effective=None, published=None, claim="free plan") -> Evidence:
+    retrieved = "2026-09-01T00:00:00+00:00"
+    provenance = EvidenceProvenance(
+        retrieval_method="safe_fetch",
+        original_url=f"https://acme.ai/{evidence_id}",
+        final_url=f"https://acme.ai/{evidence_id}",
+        http_status=200,
+        content_sha256="a" * 64,
+        retrieved_from_origin=True,
+        retrieved_at=datetime.fromisoformat(retrieved),
+    )
     return _evidence(
         f"https://acme.ai/{evidence_id}",
         source_type=source_type,
         officiality=Officiality.OFFICIAL,
+        provenance=provenance,
         evidence_id=evidence_id,
         effective_at=effective,
         published_at=published,
@@ -452,3 +488,93 @@ def test_shipped_config_anchors_use_spec_schema() -> None:
     assert match_anchor(groq, "github.com", github_repo="groq/groq") is True
     assert match_anchor(groq, "github.com", github_repo="evil/llm") is False
     assert match_anchor(by_id["huggingface"], "huggingface.co.evil.com") is False
+
+
+# --- TA-008: error-shell pages from anchored domains are not evidence --------
+
+
+def test_error_shell_from_anchored_domain_is_rejected() -> None:
+    ev = _evidence(
+        "https://acme.ai/pricing-plans",
+        officiality=Officiality.OFFICIAL,
+        claim="The author you are looking for could not be found. Author Not Found | Acme",
+        content_excerpt="Author Not Found",
+    )
+    validated = _validator().validate(ev)
+    assert validated.officiality is Officiality.REJECTED
+    assert any(note.startswith("TA-008:") for note in validated.validation_notes)
+
+
+def test_substantial_page_mentioning_404_stays_official() -> None:
+    ev = _evidence(
+        "https://acme.ai/docs/errors",
+        officiality=Officiality.OFFICIAL,
+        claim="Handling 404 not found responses | Acme API docs",
+        content_excerpt="A 404 not found response means the resource does not exist. " * 40,
+    )
+    assert _validator().validate(ev).officiality is Officiality.OFFICIAL
+
+
+def test_normal_pricing_page_stays_official() -> None:
+    ev = _evidence(
+        "https://acme.ai/pricing",
+        officiality=Officiality.OFFICIAL,
+        claim="Pricing | Acme Free Standard Enterprise",
+        content_excerpt="Free plan: 25+ free models with per-model limits. " * 40,
+    )
+    assert _validator().validate(ev).officiality is Officiality.OFFICIAL
+
+
+def test_error_shell_rule_only_applies_to_anchored_domains() -> None:
+    ev = _evidence(
+        "https://unrelated.example.com/pricing",
+        officiality=Officiality.OFFICIAL,
+        claim="Author Not Found",
+        content_excerpt="Author Not Found",
+    )
+    validated = _validator().validate(ev)
+    assert validated.officiality is Officiality.THIRD_PARTY
+
+
+# --- same-URL snapshots are one source at decision time ----------------------
+
+
+def test_same_url_snapshots_do_not_conflict() -> None:
+    older = _evidence(
+        "https://acme.ai/pricing",
+        officiality=Officiality.OFFICIAL,
+        evidence_id="ev-a",
+        claim="Pricing | Acme free plan",
+        content_excerpt="A" * 500,
+        retrieved_at="2026-09-21T06:00:00+00:00",
+    )
+    newer = _evidence(
+        "https://acme.ai/pricing",
+        officiality=Officiality.OFFICIAL,
+        evidence_id="ev-b",
+        claim="Pricing | Acme free plan",
+        content_excerpt="B" * 900,
+        retrieved_at="2026-09-21T07:00:00+00:00",
+    )
+    result = _validator().resolve_contradictions([older, newer])
+    assert result["winner"].evidence_id == "ev-b"
+    assert result["unresolved"] == []
+
+
+def test_distinct_urls_same_priority_still_conflict() -> None:
+    first = _evidence(
+        "https://acme.ai/pricing",
+        officiality=Officiality.OFFICIAL,
+        evidence_id="ev-a",
+        claim="Pricing | Acme free plan",
+        content_excerpt="A" * 500,
+    )
+    second = _evidence(
+        "https://acme.ai/pricing-plans",
+        officiality=Officiality.OFFICIAL,
+        evidence_id="ev-c",
+        claim="Plans and pricing | Acme enterprise",
+        content_excerpt="C" * 500,
+    )
+    result = _validator().resolve_contradictions([first, second])
+    assert result["unresolved"], "genuinely distinct sources without dates must stay blocked"

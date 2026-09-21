@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -245,6 +246,7 @@ def test_refetch_does_not_downgrade_likely_official(tmp_path: Path) -> None:
 def test_revalidation_does_not_duplicate_notes() -> None:
     """Repeated validation must not grow validation_notes (rerun stability)."""
     from hunter.evidence.validator import OfficialEvidenceValidator, TrustAnchor
+    from hunter.evidence.models import EvidenceProvenance
 
     validator = OfficialEvidenceValidator(
         [
@@ -256,6 +258,15 @@ def test_revalidation_does_not_duplicate_notes() -> None:
             )
         ]
     )
+    provenance = EvidenceProvenance(
+        retrieval_method="safe_fetch",
+        original_url="https://acme.ai/pricing",
+        final_url="https://acme.ai/pricing",
+        http_status=200,
+        content_sha256="a" * 64,
+        retrieved_from_origin=True,
+        retrieved_at=datetime.fromisoformat("2026-08-01T00:00:00+00:00"),
+    )
     evidence = Evidence(
         evidence_id="ev-1",
         provider_id="acme",
@@ -264,6 +275,7 @@ def test_revalidation_does_not_duplicate_notes() -> None:
         claim="free plan",
         content_excerpt="free plan programmatic API",
         retrieved_at="2026-08-01T00:00:00+00:00",
+        provenance=provenance,
     )
     once = validator.validate(evidence)
     twice = validator.validate(once)
@@ -365,7 +377,7 @@ def test_ssrf_fixture_dns_hosts_rejected_by_fetcher() -> None:
     fixture = json.loads((EVIDENCE_FIXTURES / "ssrf_targets.json").read_text(encoding="utf-8"))
     hosts = {h: addrs for h, addrs in fixture["rejected_dns"].items()}
     transport = FakeSocketTransport(hosts=hosts)
-    fetcher = SafeFetcher(transport=transport)
+    fetcher = SafeFetcher(test_transport=transport)
     for host in hosts:
         with pytest.raises(FetcherError):
             fetcher.fetch(f"https://{host}/pricing", provider_id="acme")
@@ -418,6 +430,7 @@ class FakeSocketTransport:
         self.body_size = body_size
         self.delay = delay
         self.requests = []
+        self.pinned_ips = []
 
     def resolve(self, host):
         return self.hosts.get(host, ["93.184.216.34"])
@@ -428,8 +441,9 @@ class FakeSocketTransport:
             raise FetcherError(f"blocked address for {host}")
         return addrs[0]
 
-    def request(self, url):
+    def request(self, url, pinned_ip=None):
         self.requests.append(url)
+        self.pinned_ips.append(pinned_ip)
         if self.delay:
             import time
 
@@ -449,7 +463,7 @@ class FakeSocketTransport:
 
 def _fetcher(transport=None, **kwargs) -> SafeFetcher:
     return SafeFetcher(
-        transport=transport or FakeSocketTransport(),
+        test_transport=transport or FakeSocketTransport(),
         max_redirects=kwargs.get("max_redirects", 3),
         max_body_bytes=kwargs.get("max_body_bytes", 2 * 1024 * 1024),
         total_timeout=kwargs.get("total_timeout", 10),
@@ -496,7 +510,7 @@ def test_fetcher_public_to_private_redirect_rejected() -> None:
 
 def test_fetcher_relative_redirect_uses_lowercase_location() -> None:
     class LowercaseRedirectTransport(FakeSocketTransport):
-        def request(self, url):
+        def request(self, url, pinned_ip=None):
             if url == "https://example.com/start":
                 self.requests.append(url)
                 return (302, {"location": "next"}, b"")
@@ -552,8 +566,10 @@ def test_fetcher_uses_connection_class_for_url_scheme(monkeypatch) -> None:
     monkeypatch.setattr(http.client, "HTTPConnection", HttpConnection)
     monkeypatch.setattr(http.client, "HTTPSConnection", HttpsConnection)
     fetcher = SafeFetcher(max_body_bytes=10)
-    fetcher._real_request("example.com", 80, "http://example.com/x", 1, "http")
-    fetcher._real_request("example.com", 443, "https://example.com/x", 1, "https")
+    from urllib.parse import urlparse as _urlparse
+
+    fetcher._real_request("example.com", 80, _urlparse("http://example.com/x"), 1)
+    fetcher._real_request("example.com", 443, _urlparse("https://example.com/x"), 1)
     assert [entry[0] for entry in connections] == ["HttpConnection", "HttpsConnection"]
 
 
@@ -635,7 +651,7 @@ def test_fetcher_timeout() -> None:
     import time as _t
 
     class SlowTransport(FakeSocketTransport):
-        def request(self, url):
+        def request(self, url, pinned_ip=None):
             _t.sleep(0.4)
             return (200, {"Content-Type": "text/html"}, b"late")
 
