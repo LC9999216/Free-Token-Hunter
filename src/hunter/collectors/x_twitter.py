@@ -44,6 +44,7 @@ class XCollector:
         params: Dict[str, Any] = {
             "query": query,
             "max_results": min(max(self.max_results, 10), 100),
+            "tweet.fields": "created_at,author_id",
         }
         payload = self.transport.get(
             self.base_url, params=params, headers={"Authorization": f"Bearer {self.bearer_token}"}
