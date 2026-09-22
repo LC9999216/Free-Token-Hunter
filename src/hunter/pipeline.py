@@ -15,6 +15,7 @@ new no-op History events. The default missing extractor fails closed.
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -37,6 +38,11 @@ from .registry.schema import ProviderStatus
 from .registry.store import ProviderRegistry
 from .scoring.config import load_scoring_config
 from .scoring.scores import free_score, verification_confidence
+
+# Concurrency bounds for the two IO-bound stages. Fetching is bounded per
+# candidate and persistence is serialized inside EvidenceStore/ProviderRegistry.
+EVIDENCE_BUILD_WORKERS = 8
+EXTRACTION_WORKERS = 4
 
 
 class Pipeline:
@@ -115,45 +121,59 @@ class Pipeline:
     # --- step 2: build evidence ---------------------------------------------
 
     def build_evidence(self) -> int:
-        """Resolve, fetch, and persist evidence from HTTP responses only."""
-        created = 0
-        for candidate in self.candidate_store.list_candidates():
-            observations = [obs.model_dump(mode="json") for obs in candidate.observations]
-            reviewed_entries = self.reviewed_evidence.get(candidate.candidate_id, [])
-            reviewed_types = {
-                entry["url"]: entry["source_type"] for entry in reviewed_entries
-            }
-            urls = [entry["url"] for entry in reviewed_entries]
-            if not reviewed_entries:
-                urls = self.resolver.propose_urls(
-                    candidate_domain=candidate.canonical_domain_hint,
-                    observations=observations,
+        """Resolve, fetch, and persist evidence from HTTP responses only.
+
+        Candidates are fetched concurrently (IO bound). Within one candidate
+        the proposed URLs are still processed strictly in order, so per-URL
+        ordering for one candidate is preserved.
+        """
+        with ThreadPoolExecutor(max_workers=EVIDENCE_BUILD_WORKERS) as pool:
+            counts = list(
+                pool.map(
+                    self._build_evidence_for_candidate,
+                    self.candidate_store.list_candidates(),
                 )
-            for url in urls:
-                try:
-                    result = self.fetcher.fetch(url, provider_id=candidate.candidate_id)
-                except Exception:  # noqa: BLE001 - one URL must not stop a candidate
-                    continue
-                if not 200 <= result.status < 300:
-                    continue
-                # The excerpt and claim are DERIVED from the fetched body inside
-                # from_fetch so the stored evidence stays bound to the content
-                # the SafeFetcher actually retrieved (no caller-supplied text).
-                try:
-                    evidence = Evidence.from_fetch(
-                        result,
-                        provider_id=candidate.candidate_id,
-                        source_type=(reviewed_types.get(url) or _guess_source_type(result.final_url or url)),
-                        excerpt_length=4000,
-                        retrieved_at=self.as_of,
-                        candidate_id=candidate.candidate_id,
-                        title=result.final_url or url,
-                    )
-                except ValueError:
-                    continue
-                if self.evidence_store.upsert(evidence):
-                    created += 1
+            )
         self._resolution_ready = False
+        return sum(counts)
+
+    def _build_evidence_for_candidate(self, candidate) -> int:
+        created = 0
+        observations = [obs.model_dump(mode="json") for obs in candidate.observations]
+        reviewed_entries = self.reviewed_evidence.get(candidate.candidate_id, [])
+        reviewed_types = {
+            entry["url"]: entry["source_type"] for entry in reviewed_entries
+        }
+        urls = [entry["url"] for entry in reviewed_entries]
+        if not reviewed_entries:
+            urls = self.resolver.propose_urls(
+                candidate_domain=candidate.canonical_domain_hint,
+                observations=observations,
+            )
+        for url in urls:
+            try:
+                result = self.fetcher.fetch(url, provider_id=candidate.candidate_id)
+            except Exception:  # noqa: BLE001 - one URL must not stop a candidate
+                continue
+            if not 200 <= result.status < 300:
+                continue
+            # The excerpt and claim are DERIVED from the fetched body inside
+            # from_fetch so the stored evidence stays bound to the content
+            # the SafeFetcher actually retrieved (no caller-supplied text).
+            try:
+                evidence = Evidence.from_fetch(
+                    result,
+                    provider_id=candidate.candidate_id,
+                    source_type=(reviewed_types.get(url) or _guess_source_type(result.final_url or url)),
+                    excerpt_length=4000,
+                    retrieved_at=self.as_of,
+                    candidate_id=candidate.candidate_id,
+                    title=result.final_url or url,
+                )
+            except ValueError:
+                continue
+            if self.evidence_store.upsert(evidence):
+                created += 1
         return created
 
     # --- step 3: validate officiality ----------------------------------------
@@ -204,7 +224,19 @@ class Pipeline:
     # --- step 5+6: score and confirm -----------------------------------------
 
     def score_and_confirm(self) -> Dict[str, int]:
-        """Score each candidate and confirm when every hard gate passes."""
+        """Score each candidate and confirm when every hard gate passes.
+
+        LLM extraction is IO bound, so the candidates that actually need
+        extraction are processed concurrently (max 4 in flight). Scoring and
+        confirmation stay sequential: mutation of the registry and the
+        candidate outcome sequence must remain deterministic.
+
+        Candidates whose provider record already carries the identical evidence
+        id snapshot AND a confirmed extraction from the previous commit are
+        reused as-is ("skip_uptodate"): neither extraction nor confirmation is
+        rerun. Candidates whose last extraction failed or that were never
+        confirmed have no snapshot and are always retried.
+        """
         if not self._resolution_ready:
             self.resolve_contradictions()
         outcomes = {
@@ -213,35 +245,43 @@ class Pipeline:
             "providers_updated": 0,
             "unchanged": 0,
             "errors": 0,
+            "skip_uptodate": 0,
             "candidate_outcomes": [],
         }
-        for candidate in self.candidate_store.list_candidates():
+
+        plans = self._plan_score_and_confirm(outcomes)
+
+        # Extraction runs concurrently; failures are reported per candidate in
+        # deterministic candidate order during the second pass.
+        for plan in plans:
+            future: Optional[Future] = plan["extraction_future"]
+            if future is None:
+                continue
             try:
-                evidence_items = [
-                    e
-                    for e in self.evidence_store.list()
-                    if e.candidate_id == candidate.candidate_id
-                ]
-                if not evidence_items:
+                plan["extraction"] = future.result()
+            except Exception as exc:  # noqa: BLE001 - re-raised in sequence
+                plan["extraction_error"] = exc
+            finally:
+                plan["extraction_future"] = None
+
+        for plan in plans:
+            try:
+                outcome = plan["outcome"]
+                if outcome == "skip_uptodate":
                     outcomes["unchanged"] += 1
                     continue
-                winner = self._resolved_evidence.get(candidate.candidate_id)
-                if winner is None or candidate.candidate_id in self._unresolved_contradictions:
-                    reasons = self._unresolved_contradictions.get(candidate.candidate_id)
-                    outcomes["candidate_outcomes"].append(
-                        {
-                            "candidate_id": candidate.candidate_id,
-                            "outcome": (
-                                "unresolved_contradiction"
-                                if reasons
-                                else "no_resolved_evidence"
-                            ),
-                            "reason": "; ".join(reasons or ["no evidence winner"]),
-                        }
-                    )
-                    outcomes["unchanged"] += 1
+                if outcome == "unchanged":
+                    # no_evidence / unresolved contradiction / no resolved
+                    # winner: already counted in the planning pass
+                    report = plan.get("outcome_report")
+                    if report is not None:
+                        outcomes["candidate_outcomes"].append(report)
                     continue
-                extraction = self._extraction_for(candidate.candidate_id)
+                candidate = plan["candidate"]
+                evidence_items = plan["evidence_items"]
+                if plan.get("extraction_error") is not None:
+                    raise plan["extraction_error"]
+                extraction = plan["extraction"]
                 if extraction is None or not extraction.ok:
                     # ungrounded extraction: recorded, retryable, not confirmed
                     outcomes["candidate_outcomes"].append(
@@ -261,10 +301,9 @@ class Pipeline:
                     )
                     outcomes["unchanged"] += 1
                     continue
-                provider_id = _slug(candidate.provider_name or candidate.candidate_id)
-                before = self.registry.get_provider(
-                    provider_id
-                ) or self.registry.find_by_domain(candidate.canonical_domain_hint)
+                provider_id = plan["provider_id"]
+                before = plan["before"]
+                winner = plan["winner"]
                 vc = verification_confidence(evidence_items, self.scoring_config, self.as_of)
                 requirements = _requirements_for(extraction)
                 api = _api_for(extraction)
@@ -277,7 +316,7 @@ class Pipeline:
                     _config=self.scoring_config,
                     as_of=self.as_of,
                 )
-                confirmed = confirm_provider(
+                confirm_result = confirm_provider(
                     ConfirmationInput(
                         provider_name=candidate.provider_name or candidate.candidate_id,
                         canonical_domain=candidate.canonical_domain_hint or "",
@@ -298,15 +337,17 @@ class Pipeline:
                             for evidence in evidence_items
                             if evidence.officiality.value == "OFFICIAL"
                         ],
+                        evidence_ids_snapshot=plan["evidence_ids"],
                     ),
                     self.registry,
                     self.validator,
                 )
+                plan["confirmed_revision"] = confirm_result.revision
             except ConfirmationError as exc:
                 # a hard gate rejected this candidate; nothing was mutated
                 outcomes["candidate_outcomes"].append(
                     {
-                        "candidate_id": candidate.candidate_id,
+                        "candidate_id": plan["candidate"].candidate_id,
                         "outcome": "confirmation_rejected",
                         "reason": str(exc),
                     }
@@ -316,7 +357,7 @@ class Pipeline:
             except Exception as exc:  # noqa: BLE001 - isolate and report safely
                 outcomes["candidate_outcomes"].append(
                     {
-                        "candidate_id": candidate.candidate_id,
+                        "candidate_id": plan["candidate"].candidate_id,
                         "outcome": "processing_error",
                         "reason": _sanitized_exception(exc),
                     }
@@ -325,13 +366,100 @@ class Pipeline:
                 continue
 
             outcomes["free_confirmed"] += 1
+            before = plan["before"]
             if before is None:
                 outcomes["providers_created"] += 1
-            elif confirmed.revision > before.revision:
+            elif plan["confirmed_revision"] > before.revision:
                 outcomes["providers_updated"] += 1
             else:
                 outcomes["unchanged"] += 1
+
+        skip_uptodate = outcomes["skip_uptodate"]
+        # Skip statistics are printed before the run summary counts.
+        print(f"skip_uptodate={skip_uptodate}")
         return outcomes
+
+    def _plan_score_and_confirm(self, outcomes: Dict[str, int]) -> List[Dict[str, Any]]:
+        """First pass: classify candidates and submit concurrent extractions."""
+        plans: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=EXTRACTION_WORKERS) as pool:
+            for candidate in self.candidate_store.list_candidates():
+                plan: Dict[str, Any] = {
+                    "candidate": candidate,
+                    "evidence_items": [],
+                    "evidence_ids": [],
+                    "winner": None,
+                    "provider_id": None,
+                    "before": None,
+                    "extraction": None,
+                    "extraction_error": None,
+                    "extraction_future": None,
+                    "confirmed_revision": 0,
+                    "outcome": "confirm",
+                }
+                evidence_items = [
+                    e
+                    for e in self.evidence_store.list()
+                    if e.candidate_id == candidate.candidate_id
+                ]
+                plan["evidence_items"] = evidence_items
+                plan["evidence_ids"] = sorted(
+                    e.evidence_id for e in evidence_items if e.evidence_id
+                )
+                if not evidence_items:
+                    outcomes["unchanged"] += 1
+                    plan["outcome"] = "no_evidence"
+                    plans.append(plan)
+                    continue
+                winner = self._resolved_evidence.get(candidate.candidate_id)
+                plan["winner"] = winner
+                unresolved = self._unresolved_contradictions.get(candidate.candidate_id)
+                if winner is None or unresolved:
+                    reasons = unresolved or ["no evidence winner"]
+                    plan["outcome"] = "unchanged"
+                    plan["outcome_report"] = {
+                        "candidate_id": candidate.candidate_id,
+                        "outcome": "unresolved_contradiction" if unresolved else "no_resolved_evidence",
+                        "reason": "; ".join(reasons),
+                    }
+                    outcomes["unchanged"] += 1
+                    plans.append(plan)
+                    continue
+                provider_id = _slug(candidate.provider_name or candidate.candidate_id)
+                plan["provider_id"] = provider_id
+                before = self.registry.get_provider(provider_id) or self.registry.find_by_domain(
+                    candidate.canonical_domain_hint
+                )
+                plan["before"] = before
+                if self._provider_is_uptodate(before, plan["evidence_ids"]):
+                    # Same resolved evidence id set and a confirmed provider
+                    # record from the previous commit: reuse that state.
+                    plan["outcome"] = "skip_uptodate"
+                    outcomes["skip_uptodate"] += 1
+                    outcomes["unchanged"] += 1
+                    plans.append(plan)
+                    continue
+                if self.extractor is not None:
+                    plan["extraction_future"] = pool.submit(
+                        self._extraction_for, candidate.candidate_id
+                    )
+                plans.append(plan)
+        return plans
+
+    def _provider_is_uptodate(self, before: Any, evidence_ids: List[str]) -> bool:
+        """True when the provider record already reflects these evidence ids.
+
+        The snapshot is written under provider metadata at confirmation time.
+        A provider created by another path (no snapshot) is always reprocessed.
+        """
+        if before is None or not before.evidence_ids:
+            return False
+        if before.status is not ProviderStatus.FREE_CONFIRMED:
+            return False
+        snapshot = (before.metadata or {}).get("pipeline_evidence_ids")
+        if not isinstance(snapshot, list):
+            return False
+        return sorted(snapshot) == sorted(evidence_ids)
 
     # --- full run ------------------------------------------------------------
 
@@ -367,6 +495,7 @@ class Pipeline:
             "rejected": status_counts["rejected"],
             "unchanged": outcomes["unchanged"],
             "errors": outcomes["errors"],
+            "skip_uptodate": outcomes.get("skip_uptodate", 0),
             "detail": {
                 "import_seed": seed_summary,
                 "evidence_built": evidence_built,
