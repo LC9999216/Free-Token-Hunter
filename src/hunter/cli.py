@@ -172,19 +172,22 @@ def _handle_discover(args: argparse.Namespace) -> int:
     if args.source == "all":
         from .collectors.curated_repos import CuratedRepoCollector
         from .collectors.hackernews import HackerNewsCollector
+        from .collectors.reddit import RedditCollector
         from .collectors.web_search import WebSearchCollector
+        from .collectors.x_twitter import XCollector
         from .discovery.orchestrator import _domain_from_url
 
         class _HttpTransport:
             """Minimal real HTTP transport for the discovery adapters."""
 
-            def get(self, url, params=None):
+            def get(self, url, params=None, headers=None):
                 import urllib.parse
                 import urllib.request
 
                 if params:
                     url = url + "?" + urllib.parse.urlencode(params)
-                with urllib.request.urlopen(url, timeout=30) as response:
+                request = urllib.request.Request(url, headers=headers or {})
+                with urllib.request.urlopen(request, timeout=30) as response:
                     import json
 
                     return json.loads(response.read().decode("utf-8"))
@@ -204,6 +207,23 @@ def _handle_discover(args: argparse.Namespace) -> int:
             transport=transport,
             base_url=hn_cfg.get("base_url", "https://hn.algolia.com/api/v1/search"),
             max_results=int(hn_cfg.get("max_results", 20)),
+        )
+        reddit_cfg = config.get("reddit", {})
+        collectors["reddit"] = RedditCollector(
+            transport=transport,
+            base_url=reddit_cfg.get("base_url", "https://www.reddit.com/search.json"),
+            max_results=int(reddit_cfg.get("max_results", 25)),
+            subreddit=reddit_cfg.get("subreddit") or None,
+            enabled=bool(reddit_cfg.get("enabled", True)),
+        )
+        x_cfg = config.get("x", {})
+        collectors["x"] = XCollector(
+            transport=transport,
+            bearer_token=_env_or_none("X_BEARER_TOKEN"),
+            base_url=x_cfg.get(
+                "base_url", "https://api.twitter.com/2/tweets/search/recent"
+            ),
+            max_results=int(x_cfg.get("max_results", 10)),
         )
         web_cfg = config.get("web_search", {})
         collectors["web_search"] = WebSearchCollector(

@@ -150,6 +150,10 @@ class ConfirmationInput:
     models: List[str] = field(default_factory=list)
     has_documented_limits: bool = False
     official_docs: List[str] = field(default_factory=list)
+    # Full evidence-id snapshot recorded with the confirmation so a later
+    # pipeline rerun can detect "evidence unchanged since last commit" and
+    # skip redundant re-extraction. Optional; other callers are unaffected.
+    evidence_ids_snapshot: Optional[List[str]] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.as_of, datetime) or self.as_of.tzinfo is None:
@@ -234,6 +238,13 @@ def confirm_provider(
         breakdown={"verification_confidence": inp.verification_confidence},
     )
 
+    provider_metadata: Dict[str, Any] = {
+        "confirmed_by": "confirm_provider",
+        "confirmation_as_of": inp.as_of.isoformat(),
+    }
+    if inp.evidence_ids_snapshot is not None:
+        provider_metadata["pipeline_evidence_ids"] = sorted(set(inp.evidence_ids_snapshot))
+
     provider = _build_provider(
         inp=inp,
         evidence=evidence,
@@ -241,6 +252,7 @@ def confirm_provider(
         requirements=requirements,
         api=api,
         score_metadata=score_metadata,
+        metadata=provider_metadata,
     )
 
     # Gate 1: stable identity — reuse an existing provider by canonical domain.
@@ -269,6 +281,7 @@ def _build_provider(
     requirements: ProviderRequirements,
     api: ProviderApi,
     score_metadata: ScoreMetadata,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Provider:
     provider_id = _slug(inp.provider_name)
     return Provider(
@@ -288,7 +301,9 @@ def _build_provider(
         free_score=score_metadata.score,
         score_metadata=score_metadata,
         revision=0,
-        metadata={
+        metadata=metadata
+        if metadata is not None
+        else {
             "confirmed_by": "confirm_provider",
             "confirmation_as_of": inp.as_of.isoformat(),
         },

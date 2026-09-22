@@ -1,59 +1,75 @@
 # Free Token Hunter current status
 
-Updated: 2026-09-17 (Asia/Shanghai)
+Updated: 2026-09-21 (UTC)
 
 This file is the current status source. `PROGRESS.md` records the completed Stage 1 task history;
 the older Stage 2 progress files are audit logs and may include historical stop reports.
 
+## Environment
+
+- Execution host for this update: a fresh Linux server
+  (`/home/ubuntu/Codex Projects/Free Token Hunter/Free-Token-Hunter`), branch
+  `dsh/remaining-work-execution`, venv at `.venv/`.
+- The Windows live environment (`D:\AI\Free token\...` worktrees, FlClash, `.env.live`,
+  external live-state data dir) is not present on this host. All live-run, FlClash DNS,
+  manual signup, and key-entry steps from
+  `docs/plans/2026-09-21-remaining-work-task-spec.md` are **SKIP — user-side execution**.
+
 ## Code state
 
-- Release-readiness branch: `codex/stage2-release-ready`.
-- Baseline: `codex/stage2-live-validation-remediation@d46e222`.
-- Stage 1 tasks 000–010: implemented.
-- Stage 2 offline hardening and remediation: implemented locally, not merged to `main`.
-- Production grounded extraction: wired to an OpenAI-compatible Chat Completions endpoint through
-  `HUNTER_LLM_BASE_URL`, `HUNTER_LLM_API_KEY`, and `HUNTER_LLM_MODEL`.
-- Release runs can require that boundary with `run-stage-one --require-llm`; missing or partial
-  configuration exits with code 2.
-- The LLM transport sends the key only in the Authorization header, ignores system proxies, rejects
-  redirects, bounds response size, and does not retain upstream response bodies.
+- `main` already contains the merge of `codex/live-validation-fixes` (PR #2) and
+  `codex/stage2-hardening-fixes` (PR #3), including the four 2026-09-21 fixes
+  (`f948f13` localized `icacls` decode, `4d48daa` `.venv` gitignore, `cfcfc9c` TA-008
+  soft-404 rejection, `9dd5d41` same-URL snapshot dedup).
+- Stage 1 tasks 000–010: implemented. Production grounded extraction remains wired through
+  `HUNTER_LLM_BASE_URL` / `HUNTER_LLM_API_KEY` / `HUNTER_LLM_MODEL` with
+  `run-stage-one --require-llm`.
+- Phase 3 code preparation (remaining-work T5, plan:
+  `docs/plans/2026-09-21-phase3-x-reddit-discovery-adapters.md`):
+  - `RedditCollector` (`src/hunter/collectors/reddit.py`) — public credential-free Reddit
+    JSON search, observations only, config-gated (`discovery.reddit` in `config/sources.yaml`).
+  - `XCollector` (`src/hunter/collectors/x_twitter.py`) — official X v2 recent search;
+    X has no official free search API, so the adapter stays disabled without
+    `X_BEARER_TOKEN`.
+  - Both adapters are discovery-only: they never verify providers and never touch trust
+    anchors; network is injectable and tests are offline.
+- No push was performed from this host; work is committed on
+  `dsh/remaining-work-execution` only.
 
-## Fresh offline verification
+## Fresh offline verification (this host)
 
-- Full suite: `728 passed, 1 skipped, 1 warning in 114.96s`.
-- Skip: POSIX permission-bit assertion on Windows.
-- Warning: `getpass` fallback in a non-interactive test terminal.
-- Focused production-LLM tests: `11 passed`.
+- Full suite: `747 passed, 3 skipped` (baseline on the Windows side was identical in count;
+  the three skips are the Windows-only `NT ACL path` assertions in
+  `tests/test_pool_permissions_encoding.py`, correctly skipped on Linux).
+- New Phase 3 tests: `tests/test_discovery_social.py` (7 tests, offline).
 
-## Protected persisted data
+## Live-state snapshot (external copy, per the 2026-09-21 task spec)
 
-The repository data remains unchanged:
+Recorded from the Windows live run; this host holds no live-state data:
 
-- Candidates: 69.
-- Evidence: 0.
-- Providers: 2 `UNCERTAIN`.
-- `FREE_CONFIRMED`: 0.
+- Providers: AssemblyAI `FREE_CONFIRMED` (conf 85 / free_score 30 / rev 3), Deepgram
+  `FREE_CONFIRMED` (conf 85 / 30 / rev 1), OpenRouter `UNCERTAIN` (rev 2, unconfirmed).
+- Candidates: 80 (incl. 11 from live HN discovery). Evidence: 105
+  (8 OFFICIAL, 94 LIKELY_OFFICIAL, 3 REJECTED).
+- Repository-protected `data/` remains the untouched baseline.
 
-No real key, provider request, webhook delivery, promotion, deployment, push, PR, or merge was
-performed while producing this status.
+## Remaining work (owner, in execution order)
 
-## Remaining live gates
+1. **T0** sixth pipeline rerun with `PYTHONUNBUFFERED=1` to diagnose OpenRouter — user-side
+   (Windows live env). SKIP here.
+2. **T1** FlClash DNS override + evidence collection for the five anchored candidates
+   (groq/mistral/huggingface/jina-ai/google-gemini) — user-side. SKIP here.
+3. **T2** manual signup, `getpass` key entry, staging health + four conformance canaries —
+   user-side only; keys never pass through an agent. SKIP here.
+4. **T3** approval binding, promote readback, client request, reverse-verification suspend,
+   Feishu delivery — user-side. SKIP here.
+5. **T4** merge/publish: branch merges already landed in `main`; worktree cleanup, the
+   `v0.2.0-live-validated` tag, and the final live-validation report depend on T2/T3
+   outcomes and the Windows worktrees — pending user-side execution.
+6. **T5** Reddit/X adapters: code prepared here (see above). Live collection enablement and
+   the Claude Code / `freellmpool==0.13.0` Anthropic messages interop check remain open.
+7. **T6** recurring stage-one/stage-two scheduling — optional, not started.
 
-The external live-state ACL gate passed after explicit approval: the root now grants inheritable
-full control only to the current user, SYSTEM, and Administrators. The project verification command
-reported no permission errors, missing files, or hash mismatches.
-
-1. Run evidence collection from a host whose DNS returns public provider addresses. The current
-   Codex host resolves `developers.cloudflare.com` to reserved address `198.18.0.104`, so
-   `SafeFetcher` correctly refuses the connection. Do not weaken SSRF validation to bypass this.
-2. Configure a real JSON-capable OpenAI-compatible extraction model through process environment
-   variables and run Stage 1 against an external data copy with `--require-llm`.
-3. Stop unless Stage 1 legitimately produces at least one anchored, grounded `FREE_CONFIRMED`
-   provider. Never edit Registry status or Evidence by hand.
-4. Obtain explicit authorization for that provider's API key, enter it through Pool Control
-   `getpass`, and then execute staging health plus chat, responses, streaming, and tools canaries.
-5. Complete approval binding, promotion readback, Codex/OpenCode/client interoperability,
-   downgrade/suspension, and Feishu delivery gates in order.
-
-The project is offline release-ready, but it is not live-validated or production-ready until these
-external gates pass.
+No real key, provider request, webhook delivery, promotion, deployment, or push was
+performed while producing this status. The project stays offline on this host until the
+user-side gates run.

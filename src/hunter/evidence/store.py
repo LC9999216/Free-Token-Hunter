@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -27,6 +28,10 @@ class EvidenceStore:
     def __init__(self, path: Path):
         self.path = path
         self._items: Dict[str, Evidence] = {}
+        # The pipeline fetches/upserts evidence concurrently. The persisted
+        # record set must stay byte-deterministic, so the read-modify-write
+        # inside upsert is serialized.
+        self._lock = threading.Lock()
         self._load()
 
     def _load(self) -> None:
@@ -79,6 +84,10 @@ class EvidenceStore:
         merge that actually changes the stored record is persisted atomically;
         a merge that changes nothing does not rewrite the file.
         """
+        with self._lock:
+            return self._upsert_locked(evidence)
+
+    def _upsert_locked(self, evidence: Evidence) -> bool:
         ev = evidence.finalize() if not evidence.content_fingerprint else evidence
         existing = self.find_by_url_fingerprint(ev.url, ev.content_fingerprint)
         if existing is not None:

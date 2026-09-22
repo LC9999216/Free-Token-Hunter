@@ -33,6 +33,21 @@ discovery:
     base_url: https://hn.algolia.com/api/v1/search
     max_results: 20
 
+  # Reddit public search JSON (remaining-work T5, 2026-09-21).
+  # Credential-free public endpoint; observations only, never verification.
+  reddit:
+    enabled: true
+    base_url: https://www.reddit.com/search.json
+    max_results: 25
+    # subreddit: null  # optionally narrow discovery to one subreddit
+
+  # X (Twitter) official v2 recent search (remaining-work T5, 2026-09-21).
+  # X has no official free search API: without X_BEARER_TOKEN the adapter
+  # stays disabled and contributes zero observations.
+  x:
+    base_url: https://api.twitter.com/2/tweets/search/recent
+    max_results: 10
+
   # Web search (TASK-006); disabled without credentials
   web_search:
     enabled: false
@@ -111,4 +126,7 @@ trust_anchors:
 reviewed_evidence:
   assemblyai:
     - url: https://support.assemblyai.com/articles/5370767329-can-i-sign-up-for-free
+      source_type: pricing
+  cohere:
+    - url: https://cohere.com/pricing
       source_type: pricing
